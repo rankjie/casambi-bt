@@ -151,13 +151,14 @@ class CasambiClient:
             # Initiate communication with device
             firstResp = await self._gattClient.read_gatt_char(CASA_AUTH_CHAR_UUID)
             self._logger.debug(f"Got {b2a(firstResp)}")
-
+            
             # Check type and protocol version
-            if not (firstResp[0] == 0x1 and firstResp[1] == 0xA):
-                self._connectionState = ConnectionState.ERROR
-                raise ProtocolError(
-                    "Unexpected answer from device! Wrong device or protocol version?"
-                )
+            # commented out to test for firmware 44.0
+            # if not (firstResp[0] == 0x1 and firstResp[1] == 0xA):
+            #     self._connectionState = ConnectionState.ERROR
+            #     raise ProtocolError(
+            #         "Unexpected answer from device! Wrong device or protocol version?"
+            #     )
 
             # Parse device info
             self._mtu, self._unit, self._flags, self._nonce = struct.unpack_from(
