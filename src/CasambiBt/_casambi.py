@@ -423,7 +423,7 @@ class Casambi:
                 f"Handling switch event: unit_id={data.get('unit_id')}, "
                 f"button={data.get('button')}, event={data.get('event')}"
             )
-            
+
             # Notify listeners
             for h in self._switchEventCallbacks:
                 try:

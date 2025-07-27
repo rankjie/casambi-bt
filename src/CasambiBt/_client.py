@@ -414,7 +414,7 @@ class CasambiClient:
     ) -> None:
         # TODO: Check incoming counter and direction flag
         self._inPacketCount += 1
-        
+
         # Store raw encrypted packet for reference
         raw_packet = data[:]
 
@@ -486,7 +486,7 @@ class CasambiClient:
             )
 
     def _parseSwitchEvent(self, data: bytes, packet_seq: int = None, raw_packet: bytes = None) -> None:
-        """Parse switch event packet which contains multiple message types"""
+        """Parse switch event packet which contains multiple message types."""
         self._logger.info(f"Parsing incoming switch event packet... Data: {b2a(data)}")
 
         pos = 0
@@ -494,7 +494,7 @@ class CasambiClient:
         try:
             while pos <= len(data) - 3:
                 oldPos = pos
-                
+
                 # Parse message header
                 message_type = data[pos]
                 flags = data[pos + 1]
@@ -533,7 +533,7 @@ class CasambiClient:
             )
 
     def _processSwitchMessage(self, message_type: int, flags: int, button: int, payload: bytes, full_data: bytes, start_pos: int, packet_seq: int = None, raw_packet: bytes = None) -> None:
-        """Process a switch/button message (types 0x08 or 0x10)"""
+        """Process a switch/button message (types 0x08 or 0x10)."""
         if not payload:
             self._logger.error("Switch message has empty payload")
             return
@@ -549,7 +549,7 @@ class CasambiClient:
             extra_data = payload[2:]
 
         event_string = "unknown"
-        
+
         # Different interpretation based on message type
         if message_type == 0x08:
             # Type 0x08: Use bit 1 of action for press/release
