@@ -37,6 +37,7 @@ from .errors import (  # noqa: E402
 @unique
 class IncommingPacketType(IntEnum):
     UnitState = 6
+    SwitchEvent = 7
     NetworkConfig = 9
 
 
@@ -413,6 +414,9 @@ class CasambiClient:
     ) -> None:
         # TODO: Check incoming counter and direction flag
         self._inPacketCount += 1
+        
+        # Store raw encrypted packet for reference
+        raw_packet = data[:]
 
         try:
             data = self._encryptor.decryptAndVerify(data, data[:4] + self._nonce[4:])
@@ -426,6 +430,8 @@ class CasambiClient:
 
         if packetType == IncommingPacketType.UnitState:
             self._parseUnitStates(data[1:])
+        elif packetType == IncommingPacketType.SwitchEvent:
+            self._parseSwitchEvent(data[1:], self._inPacketCount, raw_packet)
         elif packetType == IncommingPacketType.NetworkConfig:
             # We don't care about the config the network thinks it has.
             # We assume that cloud config and local config match.
@@ -478,6 +484,121 @@ class CasambiClient:
             self._logger.error(
                 f"Ran out of data while parsing unit state! Remaining data {b2a(data[oldPos:])} in {b2a(data)}."
             )
+
+    def _parseSwitchEvent(self, data: bytes, packet_seq: int = None, raw_packet: bytes = None) -> None:
+        """Parse switch event packet which contains multiple message types"""
+        self._logger.info(f"Parsing incoming switch event packet... Data: {b2a(data)}")
+
+        pos = 0
+        oldPos = 0
+        try:
+            while pos <= len(data) - 3:
+                oldPos = pos
+                
+                # Parse message header
+                message_type = data[pos]
+                flags = data[pos + 1]
+                length = ((data[pos + 2] >> 4) & 15) + 1
+                parameter = data[pos + 2] & 15
+                pos += 3
+
+                # Check if we have enough data for the payload
+                if pos + length > len(data):
+                    self._logger.debug(
+                        f"Incomplete message at position {oldPos}. "
+                        f"Type: 0x{message_type:02x}, declared length: {length}, available: {len(data) - pos}"
+                    )
+                    break
+
+                # Extract the payload
+                payload = data[pos : pos + length]
+                pos += length
+
+                # Process based on message type
+                if message_type == 0x08 or message_type == 0x10:  # Switch/button events
+                    self._processSwitchMessage(message_type, flags, parameter, payload, data, oldPos, packet_seq, raw_packet)
+                else:
+                    # Log other message types for now
+                    self._logger.debug(
+                        f"Message type 0x{message_type:02x}: flags=0x{flags:02x}, "
+                        f"param={parameter}, payload={b2a(payload)}"
+                    )
+
+                oldPos = pos
+
+        except IndexError:
+            self._logger.error(
+                f"Ran out of data while parsing switch event packet! "
+                f"Remaining data {b2a(data[oldPos:])} in {b2a(data)}."
+            )
+
+    def _processSwitchMessage(self, message_type: int, flags: int, button: int, payload: bytes, full_data: bytes, start_pos: int, packet_seq: int = None, raw_packet: bytes = None) -> None:
+        """Process a switch/button message (types 0x08 or 0x10)"""
+        if not payload:
+            self._logger.error("Switch message has empty payload")
+            return
+
+        unit_id = payload[0]
+
+        action = None
+        if len(payload) > 1:
+            action = payload[1]
+
+        extra_data = b''
+        if len(payload) > 2:
+            extra_data = payload[2:]
+
+        event_string = "unknown"
+        
+        # Different interpretation based on message type
+        if message_type == 0x08:
+            # Type 0x08: Use bit 1 of action for press/release
+            if action is not None:
+                is_release = (action >> 1) & 1
+                event_string = "button_release" if is_release else "button_press"
+        elif message_type == 0x10:
+            # Type 0x10: Must check the additional state byte after the message
+            # The action value is a counter that increments with each state change
+            additional_data_pos = start_pos + 3 + len(payload)
+            if additional_data_pos + 2 < len(full_data):
+                state_byte = full_data[additional_data_pos + 1]
+                if state_byte == 0x01:
+                    event_string = "button_press"
+                elif state_byte == 0x02:
+                    event_string = "button_release"
+                elif state_byte == 0x09:
+                    event_string = "button_hold"
+                elif state_byte == 0x0c:
+                    event_string = "button_release_after_hold"
+                else:
+                    self._logger.warning(f"Unknown state byte: 0x{state_byte:02x}")
+            else:
+                self._logger.warning("Type 0x10 message missing state byte information")
+
+        action_display = f"{action:#04x}" if action is not None else "N/A"
+
+        self._logger.info(
+            f"Switch event (type 0x{message_type:02x}): button={button}, unit_id={unit_id}, "
+            f"action={action_display} ({event_string}), flags=0x{flags:02x}"
+        )
+
+        self._dataCallback(
+            IncommingPacketType.SwitchEvent,
+            {
+                "message_type": message_type,
+                "button": button,
+                "unit_id": unit_id,
+                "action": action,
+                "event": event_string,
+                "flags": flags,
+                "extra_data": extra_data,
+                "packet_sequence": packet_seq,
+                "raw_packet": b2a(raw_packet) if raw_packet else None,
+                "decrypted_data": b2a(full_data),
+                "message_position": start_pos,
+                "payload_hex": b2a(payload),
+            },
+        )
 
     async def disconnect(self) -> None:
         self._logger.info("Disconnecting...")
