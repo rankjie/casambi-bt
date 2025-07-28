@@ -33,6 +33,12 @@ from .errors import (  # noqa: E402
     UnsupportedProtocolVersion,
 )
 
+# Import Android parser for comparison
+try:
+    from ._client_android_parser import AndroidPacketParser
+except ImportError:
+    AndroidPacketParser = None
+
 
 @unique
 class IncommingPacketType(IntEnum):
@@ -415,23 +421,35 @@ class CasambiClient:
         # TODO: Check incoming counter and direction flag
         self._inPacketCount += 1
         
-        # Store raw encrypted packet for reference
-        raw_packet = data[:]
+        # Store raw encrypted packet for Android parser analysis
+        raw_encrypted_packet = data[:]
+        
+        # Android parser comparison - disabled as protocols are incompatible
+        android_switch_event = None
+        # The Android parser expects a completely different packet format than what
+        # this implementation uses. Logging disabled to reduce noise.
 
         try:
-            data = self._encryptor.decryptAndVerify(data, data[:4] + self._nonce[4:])
+            decrypted_data = self._encryptor.decryptAndVerify(data, data[:4] + self._nonce[4:])
         except InvalidSignature:
             # We only drop packets with invalid signature here instead of going into an error state
             self._logger.error(f"Invalid signature for packet {b2a(data)}!")
             return
+            
+        # Protocol analysis: Current implementation vs Android
+        # These are fundamentally different protocols:
+        # - Current: Type 0x07 + message-based protocol (0x10/0x08 messages)
+        # - Android: Complex header with command types 29-36 for buttons
+        # No conversion possible - they're incompatible formats
+        android_switch_event = None
 
-        packetType = data[0]
-        self._logger.debug(f"Incoming data of type {packetType}: {b2a(data)}")
+        packetType = decrypted_data[0]
+        self._logger.debug(f"Incoming data of type {packetType}: {b2a(decrypted_data)}")
 
         if packetType == IncommingPacketType.UnitState:
-            self._parseUnitStates(data[1:])
+            self._parseUnitStates(decrypted_data[1:])
         elif packetType == IncommingPacketType.SwitchEvent:
-            self._parseSwitchEvent(data[1:], self._inPacketCount, raw_packet)
+            self._parseSwitchEvent(decrypted_data[1:], self._inPacketCount, raw_encrypted_packet, android_switch_event)
         elif packetType == IncommingPacketType.NetworkConfig:
             # We don't care about the config the network thinks it has.
             # We assume that cloud config and local config match.
@@ -485,12 +503,19 @@ class CasambiClient:
                 f"Ran out of data while parsing unit state! Remaining data {b2a(data[oldPos:])} in {b2a(data)}."
             )
 
-    def _parseSwitchEvent(self, data: bytes, packet_seq: int = None, raw_packet: bytes = None) -> None:
+    def _parseSwitchEvent(self, data: bytes, packet_seq: int = None, raw_packet: bytes = None, android_switch_event: dict = None) -> None:
         """Parse switch event packet which contains multiple message types"""
-        self._logger.info(f"Parsing incoming switch event packet... Data: {b2a(data)}")
+        self._logger.info(f"Parsing incoming switch event packet #{packet_seq}... Data: {b2a(data)}")
+        
+        # Special handling for message type 0x29 - not a switch event
+        if len(data) >= 1 and data[0] == 0x29:
+            self._logger.debug(f"Ignoring message type 0x29 (not a switch event): {b2a(data)}")
+            return
 
         pos = 0
         oldPos = 0
+        switch_events_found = 0
+        
         try:
             while pos <= len(data) - 3:
                 oldPos = pos
@@ -501,6 +526,15 @@ class CasambiClient:
                 length = ((data[pos + 2] >> 4) & 15) + 1
                 parameter = data[pos + 2] & 15
                 pos += 3
+
+                # Sanity check: message type should be reasonable
+                if message_type > 0x80:
+                    self._logger.debug(
+                        f"Skipping invalid message type 0x{message_type:02x} at position {oldPos}"
+                    )
+                    # Try to resync by looking for next valid message
+                    pos = oldPos + 1
+                    continue
 
                 # Check if we have enough data for the payload
                 if pos + length > len(data):
@@ -516,11 +550,21 @@ class CasambiClient:
 
                 # Process based on message type
                 if message_type == 0x08 or message_type == 0x10:  # Switch/button events
-                    self._processSwitchMessage(message_type, flags, parameter, payload, data, oldPos, packet_seq, raw_packet)
-                else:
-                    # Log other message types for now
+                    switch_events_found += 1
+                    self._processSwitchMessage(message_type, flags, parameter, payload, data, oldPos, packet_seq, raw_packet, android_switch_event)
+                elif message_type == 0x29:
+                    # This shouldn't happen due to check above, but just in case
+                    self._logger.debug(f"Ignoring embedded type 0x29 message")
+                elif message_type in [0x00, 0x06, 0x09, 0x1f, 0x2a]:
+                    # Known non-switch message types - log at debug level
                     self._logger.debug(
-                        f"Message type 0x{message_type:02x}: flags=0x{flags:02x}, "
+                        f"Non-switch message type 0x{message_type:02x}: flags=0x{flags:02x}, "
+                        f"param={parameter}, payload={b2a(payload)}"
+                    )
+                else:
+                    # Unknown message types - log at info level
+                    self._logger.info(
+                        f"Unknown message type 0x{message_type:02x}: flags=0x{flags:02x}, "
                         f"param={parameter}, payload={b2a(payload)}"
                     )
 
@@ -531,8 +575,11 @@ class CasambiClient:
                 f"Ran out of data while parsing switch event packet! "
                 f"Remaining data {b2a(data[oldPos:])} in {b2a(data)}."
             )
+            
+        if switch_events_found == 0:
+            self._logger.debug(f"No switch events found in packet: {b2a(data)}")
 
-    def _processSwitchMessage(self, message_type: int, flags: int, button: int, payload: bytes, full_data: bytes, start_pos: int, packet_seq: int = None, raw_packet: bytes = None) -> None:
+    def _processSwitchMessage(self, message_type: int, flags: int, button: int, payload: bytes, full_data: bytes, start_pos: int, packet_seq: int = None, raw_packet: bytes = None, android_switch_event: dict = None) -> None:
         """Process a switch/button message (types 0x08 or 0x10)"""
         if not payload:
             self._logger.error("Switch message has empty payload")
@@ -573,7 +620,18 @@ class CasambiClient:
                 else:
                     self._logger.warning(f"Unknown state byte: 0x{state_byte:02x}")
             else:
-                self._logger.warning("Type 0x10 message missing state byte information")
+                # For some units, type 0x10 messages don't have the state byte
+                # In these cases, check if we have extra_data that might contain state info
+                if len(extra_data) >= 3:
+                    # Pattern observed: extra_data[1] might contain state info
+                    # 0x12 seems to correlate with button release states
+                    if extra_data[1] == 0x12:
+                        event_string = "button_release"
+                    else:
+                        event_string = "button_press"
+                    self._logger.debug(f"Type 0x10: Using extra_data for state detection: {b2a(extra_data)}")
+                else:
+                    self._logger.warning("Type 0x10 message missing state byte information, cannot determine event type")
 
         action_display = f"{action:#04x}" if action is not None else "N/A"
 
@@ -581,6 +639,28 @@ class CasambiClient:
             f"Switch event (type 0x{message_type:02x}): button={button}, unit_id={unit_id}, "
             f"action={action_display} ({event_string}), flags=0x{flags:02x}"
         )
+        
+        # Include Android parser comparison if available
+        android_comparison = None
+        if android_switch_event:
+            android_comparison = {
+                'unit_id': android_switch_event['unit_id'],
+                'button': android_switch_event['button'],
+                'state': android_switch_event['state'],
+                'param_p': android_switch_event['param_p'],
+                'param_s': android_switch_event['param_s'],
+                'android_log': android_switch_event['android_log']
+            }
+            # Log differences
+            if android_switch_event['unit_id'] != unit_id:
+                self._logger.warning(f"Unit ID mismatch: current={unit_id}, android={android_switch_event['unit_id']}")
+            if android_switch_event['button'] != button:
+                self._logger.warning(f"Button mismatch: current={button}, android={android_switch_event['button']}")
+                
+        # Extract controlling unit if present
+        controlling_unit = None
+        # This is redundant since we already return early if unit_id_echo != unit_id
+        # Removing to avoid confusion
 
         self._dataCallback(
             IncommingPacketType.SwitchEvent,
@@ -592,11 +672,13 @@ class CasambiClient:
                 "event": event_string,
                 "flags": flags,
                 "extra_data": extra_data,
+                "controlling_unit": controlling_unit,
                 "packet_sequence": packet_seq,
                 "raw_packet": b2a(raw_packet) if raw_packet else None,
                 "decrypted_data": b2a(full_data),
                 "message_position": start_pos,
                 "payload_hex": b2a(payload),
+                "android_comparison": android_comparison,
             },
         )
 
