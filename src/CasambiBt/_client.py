@@ -551,9 +551,13 @@ class CasambiClient:
                 # Process based on message type
                 if message_type == 0x08 or message_type == 0x10:  # Switch/button events
                     switch_events_found += 1
-                    # For type 0x10 messages, include the full data from start position to current position
-                    # This ensures we capture any additional bytes after the declared payload
-                    full_message_data = data[oldPos:pos] if message_type == 0x10 else data
+                    # For type 0x10 messages, we need to pass additional data beyond the declared payload
+                    if message_type == 0x10:
+                        # Extend to include at least 10 bytes from message start for state byte
+                        extended_end = min(oldPos + 11, len(data))
+                        full_message_data = data[oldPos:extended_end]
+                    else:
+                        full_message_data = data
                     self._processSwitchMessage(message_type, flags, parameter, payload, full_message_data, oldPos, packet_seq, raw_packet, android_switch_event)
                 elif message_type == 0x29:
                     # This shouldn't happen due to check above, but just in case
@@ -615,6 +619,7 @@ class CasambiClient:
         elif message_type == 0x10:
             # Type 0x10: The state byte is at position 9 (0-indexed) from message start
             # This applies to all units, not just unit 31
+            # full_data for type 0x10 is the message data starting from position 0
             state_pos = 9
             if len(full_data) > state_pos:
                 state_byte = full_data[state_pos]
@@ -627,7 +632,7 @@ class CasambiClient:
                 elif state_byte == 0x0c:
                     event_string = "button_release_after_hold"
                 else:
-                    self._logger.debug(f"Type 0x10: State byte 0x{state_byte:02x} at pos {state_pos}")
+                    self._logger.debug(f"Type 0x10: Unknown state byte 0x{state_byte:02x} at message pos {state_pos}")
                     # Fallback: check if extra_data starts with 0x12 (indicates release)
                     if len(extra_data) >= 1 and extra_data[0] == 0x12:
                         event_string = "button_release"
