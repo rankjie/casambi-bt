@@ -551,13 +551,8 @@ class CasambiClient:
                 # Process based on message type
                 if message_type == 0x08 or message_type == 0x10:  # Switch/button events
                     switch_events_found += 1
-                    # Extract button ID based on message type
-                    if message_type == 0x08:
-                        # Type 0x08: button is in upper nibble of flags byte
-                        button = (flags >> 4) & 15
-                    else:  # message_type == 0x10
-                        # Type 0x10: button is the parameter field
-                        button = parameter
+                    # Extract button ID from parameter field (consistent for all message types)
+                    button = parameter
                     
                     # For type 0x10 messages, we need to pass additional data beyond the declared payload
                     if message_type == 0x10:
