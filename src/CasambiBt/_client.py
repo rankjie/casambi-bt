@@ -551,6 +551,14 @@ class CasambiClient:
                 # Process based on message type
                 if message_type == 0x08 or message_type == 0x10:  # Switch/button events
                     switch_events_found += 1
+                    # Extract button ID based on message type
+                    if message_type == 0x08:
+                        # Type 0x08: button is in upper nibble of flags byte
+                        button = (flags >> 4) & 15
+                    else:  # message_type == 0x10
+                        # Type 0x10: button is the parameter field
+                        button = parameter
+                    
                     # For type 0x10 messages, we need to pass additional data beyond the declared payload
                     if message_type == 0x10:
                         # Extend to include at least 10 bytes from message start for state byte
@@ -558,7 +566,7 @@ class CasambiClient:
                         full_message_data = data[oldPos:extended_end]
                     else:
                         full_message_data = data
-                    self._processSwitchMessage(message_type, flags, parameter, payload, full_message_data, oldPos, packet_seq, raw_packet, android_switch_event)
+                    self._processSwitchMessage(message_type, flags, button, payload, full_message_data, oldPos, packet_seq, raw_packet, android_switch_event)
                 elif message_type == 0x29:
                     # This shouldn't happen due to check above, but just in case
                     self._logger.debug(f"Ignoring embedded type 0x29 message")
