@@ -551,11 +551,17 @@ class CasambiClient:
                 # Process based on message type
                 if message_type == 0x08 or message_type == 0x10:  # Switch/button events
                     switch_events_found += 1
-                    # Extract button ID - parameter field contains the button ID
-                    # For EVO firmware: parameter encodes button ID in lower 4 bits
-                    # (0x40=button0, 0x41=button1, 0x42=button2, etc.)
-                    button = parameter & 0x0F
-                    self._logger.debug(f"EVO button extraction: parameter=0x{parameter:02x}, button={button}")
+                    # Extract button ID - try both upper and lower nibbles
+                    button_lower = parameter & 0x0F
+                    button_upper = (parameter >> 4) & 0x0F
+                    
+                    # Use upper 4 bits if lower 4 bits are 0, otherwise use lower 4 bits
+                    if button_lower == 0 and button_upper != 0:
+                        button = button_upper
+                        self._logger.debug(f"EVO button extraction: parameter=0x{parameter:02x}, using upper nibble, button={button}")
+                    else:
+                        button = button_lower
+                        self._logger.debug(f"EVO button extraction: parameter=0x{parameter:02x}, using lower nibble, button={button}")
                     
                     # For type 0x10 messages, we need to pass additional data beyond the declared payload
                     if message_type == 0x10:
