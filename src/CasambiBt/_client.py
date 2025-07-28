@@ -524,7 +524,7 @@ class CasambiClient:
                 message_type = data[pos]
                 flags = data[pos + 1]
                 length = ((data[pos + 2] >> 4) & 15) + 1
-                parameter = data[pos + 2] & 15
+                parameter = data[pos + 2]  # Full byte, not just lower 4 bits
                 pos += 3
 
                 # Sanity check: message type should be reasonable
