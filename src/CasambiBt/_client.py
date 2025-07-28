@@ -613,18 +613,15 @@ class CasambiClient:
             if len(payload) > 2:
                 extra_data = payload[2:]
         
-        # Extract action using Android-inspired approach for consistency
-        if len(payload) > 4:
-            # Use payload[4] which is consistent across message types (0 for both)
-            action = payload[4]
+        # Extract action based on message type (action SHOULD be different for press vs release)
+        if message_type == 0x10 and len(payload) > 1:
+            # Type 0x10: action is at payload[1]
+            action = payload[1]
+        elif len(payload) > 1:
+            # Other types: action is at payload[1]
+            action = payload[1]
         else:
-            # Fallback to traditional extraction for short payloads
-            if message_type == 0x10 and len(payload) > 1:
-                action = payload[1]
-            elif len(payload) > 1:
-                action = payload[1]
-            else:
-                action = None
+            action = None
 
         event_string = "unknown"
         
