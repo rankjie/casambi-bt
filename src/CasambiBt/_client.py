@@ -601,21 +601,30 @@ class CasambiClient:
             self._logger.error("Switch message has empty payload")
             return
 
-        # For type 0x10 messages, the structure is different
+        # Extract unit_id based on message type
         if message_type == 0x10 and len(payload) >= 3:
             # Type 0x10: unit_id is at payload[2]
             unit_id = payload[2]
-            action = payload[1]
             extra_data = payload[3:] if len(payload) > 3 else b''
         else:
             # Standard parsing for other message types
             unit_id = payload[0]
-            action = None
-            if len(payload) > 1:
-                action = payload[1]
             extra_data = b''
             if len(payload) > 2:
                 extra_data = payload[2:]
+        
+        # Extract action using Android-inspired approach for consistency
+        if len(payload) > 4:
+            # Use payload[4] which is consistent across message types (0 for both)
+            action = payload[4]
+        else:
+            # Fallback to traditional extraction for short payloads
+            if message_type == 0x10 and len(payload) > 1:
+                action = payload[1]
+            elif len(payload) > 1:
+                action = payload[1]
+            else:
+                action = None
 
         event_string = "unknown"
         
