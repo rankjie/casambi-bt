@@ -551,14 +551,11 @@ class CasambiClient:
                 # Process based on message type
                 if message_type == 0x08 or message_type == 0x10:  # Switch/button events
                     switch_events_found += 1
-                    # Extract button ID using Android-inspired approach
-                    # Android principle: button should be consistent for same physical button
-                    if len(payload) > 4:
-                        # Use payload[4] which is consistent across message types (0 for both)
-                        button = payload[4]
-                    else:
-                        # Fallback to parameter for short payloads
-                        button = parameter
+                    # Extract button ID - parameter field contains the button ID
+                    # For EVO firmware: parameter encodes button ID in lower 4 bits
+                    # (0x40=button0, 0x41=button1, 0x42=button2, etc.)
+                    button = parameter & 0x0F
+                    self._logger.debug(f"EVO button extraction: parameter=0x{parameter:02x}, button={button}")
                     
                     # For type 0x10 messages, we need to pass additional data beyond the declared payload
                     if message_type == 0x10:
@@ -691,6 +688,14 @@ class CasambiClient:
         controlling_unit = None
         # This is redundant since we already return early if unit_id_echo != unit_id
         # Removing to avoid confusion
+        
+        # Filter out type 0x08 messages with button=0 (likely notifications)
+        if message_type == 0x08 and button == 0:
+            self._logger.debug(
+                f"Filtering out type 0x08 notification event: button={button}, unit_id={unit_id}, "
+                f"action={action_display}, flags=0x{flags:02x}"
+            )
+            return
 
         self._dataCallback(
             IncommingPacketType.SwitchEvent,
