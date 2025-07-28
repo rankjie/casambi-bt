@@ -585,15 +585,21 @@ class CasambiClient:
             self._logger.error("Switch message has empty payload")
             return
 
-        unit_id = payload[0]
-
-        action = None
-        if len(payload) > 1:
+        # For type 0x10 messages, the structure might be different
+        if message_type == 0x10 and len(payload) >= 3 and payload[2] == 0x1f:
+            # Special case: unit_id might be in payload[2] for some type 0x10 messages
+            unit_id = payload[2]
             action = payload[1]
-
-        extra_data = b''
-        if len(payload) > 2:
-            extra_data = payload[2:]
+            extra_data = payload[3:] if len(payload) > 3 else b''
+        else:
+            # Standard parsing
+            unit_id = payload[0]
+            action = None
+            if len(payload) > 1:
+                action = payload[1]
+            extra_data = b''
+            if len(payload) > 2:
+                extra_data = payload[2:]
 
         event_string = "unknown"
         
@@ -622,16 +628,16 @@ class CasambiClient:
             else:
                 # For some units, type 0x10 messages don't have the state byte
                 # In these cases, check if we have extra_data that might contain state info
-                if len(extra_data) >= 3:
-                    # Pattern observed: extra_data[1] might contain state info
+                if len(extra_data) >= 2:
+                    # Pattern observed: extra_data[0] might contain state info
                     # 0x12 seems to correlate with button release states
-                    if extra_data[1] == 0x12:
+                    if extra_data[0] == 0x12:
                         event_string = "button_release"
                     else:
                         event_string = "button_press"
                     self._logger.debug(f"Type 0x10: Using extra_data for state detection: {b2a(extra_data)}")
                 else:
-                    self._logger.warning("Type 0x10 message missing state byte information, cannot determine event type")
+                    self._logger.warning(f"Type 0x10 message missing state info, payload: {b2a(payload)}")
 
         action_display = f"{action:#04x}" if action is not None else "N/A"
 
