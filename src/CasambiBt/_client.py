@@ -551,8 +551,14 @@ class CasambiClient:
                 # Process based on message type
                 if message_type == 0x08 or message_type == 0x10:  # Switch/button events
                     switch_events_found += 1
-                    # Extract button ID from parameter field (consistent for all message types)
-                    button = parameter
+                    # Extract button ID using Android-inspired approach
+                    # Android principle: button should be consistent for same physical button
+                    if len(payload) > 4:
+                        # Use payload[4] which is consistent across message types (0 for both)
+                        button = payload[4]
+                    else:
+                        # Fallback to parameter for short payloads
+                        button = parameter
                     
                     # For type 0x10 messages, we need to pass additional data beyond the declared payload
                     if message_type == 0x10:
