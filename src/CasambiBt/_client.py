@@ -551,7 +551,10 @@ class CasambiClient:
                 # Process based on message type
                 if message_type == 0x08 or message_type == 0x10:  # Switch/button events
                     switch_events_found += 1
-                    self._processSwitchMessage(message_type, flags, parameter, payload, data, oldPos, packet_seq, raw_packet, android_switch_event)
+                    # For type 0x10 messages, include the full data from start position to current position
+                    # This ensures we capture any additional bytes after the declared payload
+                    full_message_data = data[oldPos:pos] if message_type == 0x10 else data
+                    self._processSwitchMessage(message_type, flags, parameter, payload, full_message_data, oldPos, packet_seq, raw_packet, android_switch_event)
                 elif message_type == 0x29:
                     # This shouldn't happen due to check above, but just in case
                     self._logger.debug(f"Ignoring embedded type 0x29 message")
@@ -585,14 +588,14 @@ class CasambiClient:
             self._logger.error("Switch message has empty payload")
             return
 
-        # For type 0x10 messages, the structure might be different
-        if message_type == 0x10 and len(payload) >= 3 and payload[2] == 0x1f:
-            # Special case: unit_id might be in payload[2] for some type 0x10 messages
+        # For type 0x10 messages, the structure is different
+        if message_type == 0x10 and len(payload) >= 3:
+            # Type 0x10: unit_id is at payload[2]
             unit_id = payload[2]
             action = payload[1]
             extra_data = payload[3:] if len(payload) > 3 else b''
         else:
-            # Standard parsing
+            # Standard parsing for other message types
             unit_id = payload[0]
             action = None
             if len(payload) > 1:
@@ -610,11 +613,11 @@ class CasambiClient:
                 is_release = (action >> 1) & 1
                 event_string = "button_release" if is_release else "button_press"
         elif message_type == 0x10:
-            # Type 0x10: Must check the additional state byte after the message
-            # The action value is a counter that increments with each state change
-            additional_data_pos = start_pos + 3 + len(payload)
-            if additional_data_pos + 2 < len(full_data):
-                state_byte = full_data[additional_data_pos + 1]
+            # Type 0x10: The state byte is at position 9 (0-indexed) from message start
+            # This applies to all units, not just unit 31
+            state_pos = 9
+            if len(full_data) > state_pos:
+                state_byte = full_data[state_pos]
                 if state_byte == 0x01:
                     event_string = "button_press"
                 elif state_byte == 0x02:
@@ -624,20 +627,21 @@ class CasambiClient:
                 elif state_byte == 0x0c:
                     event_string = "button_release_after_hold"
                 else:
-                    self._logger.warning(f"Unknown state byte: 0x{state_byte:02x}")
-            else:
-                # For some units, type 0x10 messages don't have the state byte
-                # In these cases, check if we have extra_data that might contain state info
-                if len(extra_data) >= 2:
-                    # Pattern observed: extra_data[0] might contain state info
-                    # 0x12 seems to correlate with button release states
-                    if extra_data[0] == 0x12:
+                    self._logger.debug(f"Type 0x10: State byte 0x{state_byte:02x} at pos {state_pos}")
+                    # Fallback: check if extra_data starts with 0x12 (indicates release)
+                    if len(extra_data) >= 1 and extra_data[0] == 0x12:
                         event_string = "button_release"
                     else:
                         event_string = "button_press"
-                    self._logger.debug(f"Type 0x10: Using extra_data for state detection: {b2a(extra_data)}")
+            else:
+                # Fallback when message is too short
+                if len(extra_data) >= 1 and extra_data[0] == 0x12:
+                    event_string = "button_release"
+                    self._logger.debug(f"Type 0x10: Using extra_data pattern for release detection")
                 else:
-                    self._logger.warning(f"Type 0x10 message missing state info, payload: {b2a(payload)}")
+                    # Cannot determine state
+                    self._logger.warning(f"Type 0x10 message missing state info, unit_id={unit_id}, payload={b2a(payload)}")
+                    event_string = "unknown"
 
         action_display = f"{action:#04x}" if action is not None else "N/A"
 
