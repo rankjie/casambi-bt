@@ -75,6 +75,7 @@ class UnitType:
     :ivar model: The model name of this unit type.
     :ivar manufacturer: The manufacturer of this unit type.
     :ivar controls: The different types of controls this unit type is capable of.
+    :ivar pushButtonCount: The number of push buttons this unit type has (optional).
     """
 
     id: int
@@ -83,6 +84,7 @@ class UnitType:
     mode: str
     stateLength: int
     controls: list[UnitControl]
+    pushButtonCount: int | None = None
 
     def get_control(self, controlType: UnitControlType) -> UnitControl | None:
         """Return the control description if the unit type supports the given type of control.

@@ -382,6 +382,7 @@ class Network:
             unitTypeJson["mode"],
             unitTypeJson["stateLength"],
             controls,
+            unitTypeJson.get("pushButtonCount"),
         )
 
         # Chache unit type
