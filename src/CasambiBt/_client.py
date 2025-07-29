@@ -695,10 +695,10 @@ class CasambiClient:
         # This is redundant since we already return early if unit_id_echo != unit_id
         # Removing to avoid confusion
         
-        # Filter out type 0x08 messages with button=0 (likely notifications)
-        if message_type == 0x08 and button == 0:
+        # Filter out all type 0x08 messages
+        if message_type == 0x08:
             self._logger.debug(
-                f"Filtering out type 0x08 notification event: button={button}, unit_id={unit_id}, "
+                f"Filtering out type 0x08 event: button={button}, unit_id={unit_id}, "
                 f"action={action_display}, flags=0x{flags:02x}"
             )
             return
