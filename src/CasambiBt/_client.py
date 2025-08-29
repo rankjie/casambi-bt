@@ -512,6 +512,9 @@ class CasambiClient:
             self._logger.debug(f"Ignoring message type 0x29 (not a switch event): {b2a(data)}")
             return
 
+        # NEW PARSING: Android-style protocol parsing (for comparison only)
+        self._parseAndroidProtocol(data, packet_seq, raw_packet)
+
         pos = 0
         oldPos = 0
         switch_events_found = 0
@@ -551,18 +554,41 @@ class CasambiClient:
                 # Process based on message type
                 if message_type == 0x08 or message_type == 0x10:  # Switch/button events
                     switch_events_found += 1
-                    # Extract button ID - try both upper and lower nibbles
-                    button_lower = parameter & 0x0F
-                    button_upper = (parameter >> 4) & 0x0F
                     
-                    # Use upper 4 bits if lower 4 bits are 0, otherwise use lower 4 bits
-                    if button_lower == 0 and button_upper != 0:
-                        button = button_upper
-                        self._logger.debug(f"EVO button extraction: parameter=0x{parameter:02x}, using upper nibble, button={button}")
+                    # Enhanced button extraction for battery-powered switches
+                    # For type 0x08, the parameter byte encodes the button differently
+                    if message_type == 0x08:
+                        # Type 0x08: Check if this might be using Android-style encoding
+                        # where button is in upper nibble when lower nibble is 0
+                        button_lower = parameter & 0x0F
+                        button_upper = (parameter >> 4) & 0x0F
+                        
+                        # Log both interpretations for comparison
+                        self._logger.debug(
+                            f"[TYPE 0x08 ANALYSIS] parameter=0x{parameter:02x}, "
+                            f"lower_nibble={button_lower}, upper_nibble={button_upper}"
+                        )
+                        
+                        # If lower nibble is 0 and upper nibble is not, use upper
+                        # This handles cases like 0x20 (button 2), 0x30 (button 3), etc.
+                        if button_lower == 0 and button_upper != 0:
+                            button = button_upper
+                            self._logger.info(
+                                f"[TYPE 0x08 FIX] Using upper nibble for button: {button} "
+                                f"(parameter=0x{parameter:02x})"
+                            )
+                        else:
+                            button = button_lower
+                            self._logger.debug(
+                                f"[TYPE 0x08] Using lower nibble for button: {button} "
+                                f"(parameter=0x{parameter:02x})"
+                            )
                     else:
-                        button = button_lower
-                        self._logger.debug(f"EVO button extraction: parameter=0x{parameter:02x}, using lower nibble, button={button}")
-                    
+                        # Type 0x10: Standard extraction from lower nibble
+                        button = parameter & 0x0F
+                        self._logger.debug(
+                            f"[TYPE 0x10] Button extraction: parameter=0x{parameter:02x}, button={button}"
+                        )
                     # For type 0x10 messages, we need to pass additional data beyond the declared payload
                     if message_type == 0x10:
                         # Extend to include at least 10 bytes from message start for state byte
@@ -598,8 +624,91 @@ class CasambiClient:
         if switch_events_found == 0:
             self._logger.debug(f"No switch events found in packet: {b2a(data)}")
 
-    def _processSwitchMessage(self, message_type: int, flags: int, button: int, payload: bytes, full_data: bytes, start_pos: int, packet_seq: int = None, raw_packet: bytes = None, android_switch_event: dict = None) -> None:
-        """Process a switch/button message (types 0x08 or 0x10)"""
+    def _parseAndroidProtocol(
+        self, data: bytes, packet_seq: int = None, raw_packet: bytes = None
+    ) -> None:
+        """
+        Parse using Android app's protocol structure (for comparison only).
+        This doesn't generate events, just logs what it would detect.
+        
+        Android protocol structure:
+        - 2 bytes: Header/flags
+        - 1 byte: Command type (29-36 for ButtonEvent0-7)
+        - 2 bytes: Origin
+        - 2 bytes: Target (lower byte = type, upper byte = unit ID)
+        - 2 bytes: Age
+        - Variable: Payload
+        """
+        try:
+            # Check if data looks like Android protocol format
+            if len(data) < 9:
+                return
+            
+            # Try to parse as Android protocol
+            pos = 0
+            if data[0] in [0x08, 0x10]:  # This is BLE protocol, not Android protocol
+                return
+                
+            # Attempt Android protocol parsing
+            try:
+                import struct
+                # Read header
+                header = struct.unpack_from(">H", data, 0)[0]
+                command_type = data[2] if len(data) > 2 else 0
+                origin = struct.unpack_from(">H", data, 3)[0] if len(data) > 4 else 0
+                target = struct.unpack_from(">H", data, 5)[0] if len(data) > 6 else 0
+                age = struct.unpack_from(">H", data, 7)[0] if len(data) > 8 else 0
+                
+                payload_length = (header & 0x3F)  # Lower 6 bits
+                lifetime = (header >> 11) & 0x0F  # Bits 11-14
+                
+                target_type = target & 0xFF  # Lower byte
+                unit_id = target >> 8  # Upper byte
+                
+                # Check if this is a switch event (target type = 6)
+                if target_type == 6 and 29 <= command_type <= 36:
+                    button_index = command_type - 29
+                    
+                    if len(data) >= 10:
+                        payload_start = 9
+                        if len(data) >= payload_start + 1:
+                            first_payload_byte = data[payload_start]
+                            param_p = (first_payload_byte >> 3) & 0x0F
+                            param_s = first_payload_byte & 0x07
+                            state = (first_payload_byte & 0x80) >> 7
+                            
+                            self._logger.info(
+                                f"[ANDROID PROTOCOL] Unit {unit_id} Switch event: "
+                                f"button #{button_index} (P{param_p} S{param_s}) = {state} "
+                                f"(1=pressed, 0=released)"
+                            )
+                            
+                            # Compare with what current parsing would detect
+                            self._logger.debug(
+                                f"[ANDROID PROTOCOL] Full parse: header=0x{header:04x}, "
+                                f"cmd={command_type}, origin={origin}, target=0x{target:04x}, "
+                                f"lifetime={lifetime}, age={age}, payload_len={payload_length}"
+                            )
+            except:
+                # Not Android protocol format, skip
+                pass
+                
+        except Exception as e:
+            # Silently ignore - this is just for comparison
+            pass
+
+    def _processSwitchMessage(
+        self,
+        message_type: int,
+        flags: int,
+        button: int,
+        payload: bytes,
+        full_data: bytes,
+        start_pos: int,
+        packet_seq: int = None,
+        raw_packet: bytes = None,
+    ) -> None:
+        """Process a switch/button message (types 0x08 or 0x10)."""
         if not payload:
             self._logger.error("Switch message has empty payload")
             return
@@ -634,13 +743,25 @@ class CasambiClient:
             if action is not None:
                 is_release = (action >> 1) & 1
                 event_string = "button_release" if is_release else "button_press"
+                
+                # NEW: Enhanced logging for battery-powered switches
+                self._logger.debug(
+                    f"[TYPE 0x08 STATE] action=0x{action:02x}, release_bit={is_release}, "
+                    f"event={event_string}, unit_id={unit_id}, button={button}"
+                )
         elif message_type == 0x10:
             # Type 0x10: The state byte is at position 9 (0-indexed) from message start
-            # This applies to all units, not just unit 31
+            # This applies to all units, including battery-powered switches
             # full_data for type 0x10 is the message data starting from position 0
             state_pos = 9
             if len(full_data) > state_pos:
                 state_byte = full_data[state_pos]
+                
+                # NEW: Enhanced state detection with logging
+                self._logger.debug(
+                    f"[TYPE 0x10 STATE] State byte at pos {state_pos}: 0x{state_byte:02x}"
+                )
+                
                 if state_byte == 0x01:
                     event_string = "button_press"
                 elif state_byte == 0x02:
@@ -650,21 +771,56 @@ class CasambiClient:
                 elif state_byte == 0x0c:
                     event_string = "button_release_after_hold"
                 else:
-                    self._logger.debug(f"Type 0x10: Unknown state byte 0x{state_byte:02x} at message pos {state_pos}")
-                    # Fallback: check if extra_data starts with 0x12 (indicates release)
-                    if len(extra_data) >= 1 and extra_data[0] == 0x12:
-                        event_string = "button_release"
+                    # More detailed logging for unknown states
+                    self._logger.info(
+                        f"[TYPE 0x10 STATE] Unknown state byte 0x{state_byte:02x} at pos {state_pos}, "
+                        f"unit_id={unit_id}, button={button}, full_data={b2a(full_data)}"
+                    )
+                    
+                    # Enhanced fallback logic for battery-powered switches
+                    # Check multiple patterns that indicate release
+                    if len(extra_data) >= 1:
+                        first_extra = extra_data[0]
+                        if first_extra == 0x12:
+                            event_string = "button_release"
+                            self._logger.debug("[TYPE 0x10 STATE] Detected release via 0x12 pattern")
+                        elif first_extra in [0x00, 0x10]:
+                            event_string = "button_press"
+                            self._logger.debug(f"[TYPE 0x10 STATE] Detected press via 0x{first_extra:02x} pattern")
+                        else:
+                            # Check action byte patterns
+                            if action is not None:
+                                # Common patterns: 0xf8/0xfb = press, 0xfa/0xfc = release
+                                if action in [0xf8, 0xfb, 0xf7, 0xf9]:
+                                    event_string = "button_press"
+                                    self._logger.debug(f"[TYPE 0x10 STATE] Detected press via action 0x{action:02x}")
+                                elif action in [0xfa, 0xfc, 0xfd, 0xfe]:
+                                    event_string = "button_release"
+                                    self._logger.debug(f"[TYPE 0x10 STATE] Detected release via action 0x{action:02x}")
+                                else:
+                                    event_string = "button_press"  # Default to press
+                                    self._logger.debug(f"[TYPE 0x10 STATE] Defaulting to press for action 0x{action:02x}")
+                            else:
+                                event_string = "button_press"  # Default to press
                     else:
-                        event_string = "button_press"
+                        event_string = "button_press"  # Default to press when no extra data
             else:
                 # Fallback when message is too short
+                self._logger.warning(
+                    f"[TYPE 0x10 STATE] Message too short for state byte (len={len(full_data)}), "
+                    f"unit_id={unit_id}, button={button}, payload={b2a(payload)}"
+                )
+                
+                # Use enhanced fallback detection
                 if len(extra_data) >= 1 and extra_data[0] == 0x12:
                     event_string = "button_release"
-                    self._logger.debug(f"Type 0x10: Using extra_data pattern for release detection")
+                    self._logger.debug("[TYPE 0x10 STATE] Using 0x12 pattern for release (short message)")
+                elif action is not None and action in [0xfa, 0xfc, 0xfd, 0xfe]:
+                    event_string = "button_release"
+                    self._logger.debug(f"[TYPE 0x10 STATE] Using action pattern 0x{action:02x} for release (short message)")
                 else:
-                    # Cannot determine state
-                    self._logger.warning(f"Type 0x10 message missing state info, unit_id={unit_id}, payload={b2a(payload)}")
-                    event_string = "unknown"
+                    event_string = "button_press"  # Default to press
+                    self._logger.debug("[TYPE 0x10 STATE] Defaulting to press (short message)")
 
         action_display = f"{action:#04x}" if action is not None else "N/A"
 
