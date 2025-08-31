@@ -11,6 +11,7 @@ class OpCode(IntEnum):
     SetWhite = 5
     SetColor = 7
     SetSlider = 12
+    SetParameter = 26
     SetState = 48
     SetColorXY = 54
 

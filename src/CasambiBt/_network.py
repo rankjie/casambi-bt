@@ -44,6 +44,7 @@ class Network:
         self._networkName: str | None = None
         self._networkRevision: int | None = None
         self._protocolVersion: int = -1
+        self._rawNetworkData: dict | None = None
 
         self._unitTypes: dict[int, tuple[UnitType | None, datetime]] = {}
         self.units: list[Unit] = []
@@ -153,6 +154,10 @@ class Network:
     def protocolVersion(self) -> int:
         return self._protocolVersion
 
+    @property
+    def rawNetworkData(self) -> dict | None:
+        return self._rawNetworkData
+
     async def logIn(self, password: str, forceOffline: bool = False) -> None:
         await self.getNetworkId(forceOffline)
 
@@ -191,6 +196,7 @@ class Network:
             cachedNetworkPah = cachePath / f"{self._id}.json"
             if await cachedNetworkPah.exists():
                 network = json.loads(await cachedNetworkPah.read_bytes())
+                self._rawNetworkData = network
                 self._networkRevision = network["network"]["revision"]
                 self._logger.info(
                     f"Loaded cached network. Revision: {self._networkRevision}"
@@ -233,6 +239,7 @@ class Network:
                 updateResult = res.json()
                 if updateResult["status"] != "UPTODATE":
                     self._networkRevision = updateResult["network"]["revision"]
+                    self._rawNetworkData = updateResult
                     async with self._cache as cachePath:
                         cachedNetworkPah = cachePath / f"{self._id}.json"
                         await cachedNetworkPah.write_bytes(res.content)

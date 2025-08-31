@@ -98,6 +98,16 @@ class Casambi:
             and self._casaClient._connectionState == ConnectionState.AUTHENTICATED
         )
 
+    @property
+    def rawNetworkData(self) -> dict | None:
+        """Get the raw network configuration data if available.
+        
+        :return: The raw network JSON data or None if not connected.
+        """
+        if self._casaNetwork:
+            return self._casaNetwork.rawNetworkData
+        return None
+
     async def connect(
         self,
         addr_or_device: str | BLEDevice,
@@ -540,6 +550,91 @@ class Casambi:
                     f"Exception occurred in disconnectCallback {d}.",
                     exc_info=True,
                 )
+
+    async def setParameter(self, unitId: int, parameterTag: int, parameterData: bytes) -> None:
+        """Send a SetParameter command to a unit.
+        
+        Args:
+            unitId: The ID of the unit to send the command to
+            parameterTag: The parameter tag/ID to update
+            parameterData: The raw parameter data to send
+        """
+        if not self._casaClient:
+            raise RuntimeError("Not connected to network")
+        
+        # Build payload: [parameter_tag][parameter_data]
+        payload = bytes([parameterTag]) + parameterData[:31]  # Max 31 bytes of data after tag
+        
+        # Send using OpCode.SetParameter (26)
+        await self._casaClient._send(OpCode.SetParameter, unitId, payload)
+    
+    async def update_button_config(self, unit_id: int, button_index: int, action_type: str = "control_unit", target_unit_id: int = None) -> None:
+        """Update the configuration of a button on a switch unit.
+        
+        Args:
+            unit_id: The ID of the unit with the button/switch
+            button_index: The index of the button to configure (0-based)
+            action_type: The type of action ("none", "control_unit", "scene", "cycle_modes")
+                        - "none": Disable the button (no action)
+                        - "control_unit": Control a specific unit (requires target_unit_id)
+                        - "scene": Activate a scene
+                        - "cycle_modes": Cycle through modes
+            target_unit_id: The ID of the target unit (required for control_unit action)
+        """
+        if not self._casaClient:
+            raise RuntimeError("Not connected to network")
+        
+        # Get the unit
+        unit = self.units.get(unit_id)
+        if not unit:
+            raise ValueError(f"Unit {unit_id} not found")
+        
+        # Get current switch config
+        switch_config = unit.unitConfig.get("switchConfig", {})
+        buttons = switch_config.get("buttons", [])
+        
+        # Ensure we have enough buttons
+        while len(buttons) <= button_index:
+            buttons.append({})
+        
+        # Update the button configuration
+        button_config = buttons[button_index]
+        
+        if action_type == "none":
+            # Clear the button configuration - button does nothing
+            button_config = {}
+        elif action_type == "control_unit" and target_unit_id is not None:
+            # Configure button to control a specific unit
+            button_config["type"] = 0  # ControlUnit type
+            button_config["target"] = (target_unit_id << 8) | 1  # Unit target encoding
+            button_config["minDimLevel"] = 0.0
+        elif action_type == "scene":
+            button_config["type"] = 2  # Scene type
+            button_config["target"] = target_unit_id if target_unit_id else 1
+        elif action_type == "cycle_modes":
+            button_config["type"] = 1  # CycleModes type
+            button_config["includeOffUnits"] = True
+        else:
+            raise ValueError(f"Unknown action_type: {action_type}")
+        
+        # Update the buttons list
+        buttons[button_index] = button_config
+        switch_config["buttons"] = buttons
+        
+        # Convert to JSON and then to bytes
+        import json
+        config_json = json.dumps(switch_config, separators=(',', ':'))
+        config_bytes = config_json.encode('utf-8')
+        
+        # Find the parameter tag for switchConfig
+        # Based on Android analysis, switchConfig typically uses a specific tag
+        # This may need adjustment based on the actual device
+        SWITCH_CONFIG_TAG = 1  # This needs to be determined from the device
+        
+        # Send the parameter update
+        await self.setParameter(unit_id, SWITCH_CONFIG_TAG, config_bytes)
+        
+        self._logger.info(f"Updated button {button_index} on unit {unit_id} to {action_type} targeting {target_unit_id}")
 
     async def disconnect(self) -> None:
         """Disconnect from the network."""
