@@ -552,21 +552,32 @@ class CasambiClient:
                 # Process based on message type
                 if message_type == 0x08 or message_type == 0x10:  # Switch/button events
                     switch_events_found += 1
-                    # Extract button ID - try both upper and lower nibbles
-                    button_lower = parameter & 0x0F
-                    button_upper = (parameter >> 4) & 0x0F
-
-                    # Use upper 4 bits if lower 4 bits are 0, otherwise use lower 4 bits
-                    if button_lower == 0 and button_upper != 0:
-                        button = button_upper
+                    
+                    # Button extraction differs between type 0x08 and type 0x10
+                    if message_type == 0x08:
+                        # For type 0x08, the lower nibble is a code that maps to physical button id
+                        # Using formula: ((code + 2) % 4) + 1 based on reverse engineering findings
+                        code_nibble = parameter & 0x0F
+                        button = ((code_nibble + 2) % 4) + 1
                         self._logger.debug(
-                            f"EVO button extraction: parameter=0x{parameter:02x}, using upper nibble, button={button}"
+                            f"Type 0x08 button extraction: parameter=0x{parameter:02x}, code={code_nibble}, button={button}"
                         )
                     else:
-                        button = button_lower
-                        self._logger.debug(
-                            f"EVO button extraction: parameter=0x{parameter:02x}, using lower nibble, button={button}"
-                        )
+                        # For type 0x10, use existing logic
+                        button_lower = parameter & 0x0F
+                        button_upper = (parameter >> 4) & 0x0F
+
+                        # Use upper 4 bits if lower 4 bits are 0, otherwise use lower 4 bits
+                        if button_lower == 0 and button_upper != 0:
+                            button = button_upper
+                            self._logger.debug(
+                                f"Type 0x10 button extraction: parameter=0x{parameter:02x}, using upper nibble, button={button}"
+                            )
+                        else:
+                            button = button_lower
+                            self._logger.debug(
+                                f"Type 0x10 button extraction: parameter=0x{parameter:02x}, using lower nibble, button={button}"
+                            )
 
                     # For type 0x10 messages, we need to pass additional data beyond the declared payload
                     if message_type == 0x10:
@@ -705,13 +716,12 @@ class CasambiClient:
             f"action={action_display} ({event_string}), flags=0x{flags:02x}"
         )
 
-        # Filter out all type 0x08 messages
+        # Log detailed info about type 0x08 messages (now processed, not filtered)
         if message_type == 0x08:
-            self._logger.debug(
-                f"Filtering out type 0x08 event: button={button}, unit_id={unit_id}, "
-                f"action={action_display}, flags=0x{flags:02x}"
+            self._logger.info(
+                f"Type 0x08 event processed: button={button}, unit_id={unit_id}, "
+                f"action={action_display}, event={event_string}, flags=0x{flags:02x}"
             )
-            return
 
         self._dataCallback(
             IncommingPacketType.SwitchEvent,
