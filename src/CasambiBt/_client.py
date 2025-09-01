@@ -418,6 +418,13 @@ class CasambiClient:
         # Store raw encrypted packet for reference
         raw_encrypted_packet = data[:]
 
+        # Extract the device-provided 4-byte little-endian counter from the
+        # encrypted header. This is the true per-session packet sequence.
+        try:
+            device_sequence = int.from_bytes(data[:4], byteorder="little", signed=False)
+        except Exception:
+            device_sequence = None
+
         try:
             decrypted_data = self._encryptor.decryptAndVerify(
                 data, data[:4] + self._nonce[4:]
@@ -433,8 +440,11 @@ class CasambiClient:
         if packetType == IncommingPacketType.UnitState:
             self._parseUnitStates(decrypted_data[1:])
         elif packetType == IncommingPacketType.SwitchEvent:
+            # Pass the device sequence as the packet sequence for consumers,
+            # and still include the raw encrypted packet for diagnostics.
+            seq_for_consumer = device_sequence if device_sequence is not None else self._inPacketCount
             self._parseSwitchEvent(
-                decrypted_data[1:], self._inPacketCount, raw_encrypted_packet
+                decrypted_data[1:], seq_for_consumer, raw_encrypted_packet
             )
         elif packetType == IncommingPacketType.NetworkConfig:
             # We don't care about the config the network thinks it has.
@@ -733,7 +743,11 @@ class CasambiClient:
                 "event": event_string,
                 "flags": flags,
                 "extra_data": extra_data,
+                # packet_sequence is the device-provided sequence number when available
+                # (true 32-bit counter from the BLE header), otherwise the local arrival index.
                 "packet_sequence": packet_seq,
+                # Include the local arrival index for debugging and correlation.
+                "arrival_sequence": self._inPacketCount,
                 "raw_packet": b2a(raw_packet) if raw_packet else None,
                 "decrypted_data": b2a(full_data),
                 "message_position": start_pos,
