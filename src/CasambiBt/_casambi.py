@@ -563,78 +563,257 @@ class Casambi:
             raise RuntimeError("Not connected to network")
         
         # Build payload: [parameter_tag][parameter_data]
-        payload = bytes([parameterTag]) + parameterData[:31]  # Max 31 bytes of data after tag
+        # Note: SetParameter supports max 31 bytes after the tag.
+        payload = bytes([parameterTag]) + parameterData[:31]
         
         # Send using OpCode.SetParameter (26)
-        await self._casaClient._send(OpCode.SetParameter, unitId, payload)
-    
-    async def update_button_config(self, unit_id: int, button_index: int, action_type: str = "control_unit", target_unit_id: int = None) -> None:
-        """Update the configuration of a button on a switch unit.
-        
-        Args:
-            unit_id: The ID of the unit with the button/switch
-            button_index: The index of the button to configure (0-based)
-            action_type: The type of action ("none", "control_unit", "scene", "cycle_modes")
-                        - "none": Disable the button (no action)
-                        - "control_unit": Control a specific unit (requires target_unit_id)
-                        - "scene": Activate a scene
-                        - "cycle_modes": Cycle through modes
-            target_unit_id: The ID of the target unit (required for control_unit action)
+        opPkt = self._opContext.prepareOperation(OpCode.SetParameter, (unitId << 8) | 0x01, payload)
+        await self._casaClient.send(opPkt)
+
+    async def send_ext_packet(self, unit_id: int, seq: int, chunk: bytes, *, lifetime: int = 9) -> None:
+        """Send an extended packet (ExtPacketSend / opcode 43) to a unit.
+
+        Payload is framed as: [0x29][seq][chunk...]
+
+        Notes:
+        - Total payload must be <= 63 bytes, so len(chunk) <= 61.
+        - Lifetime defaults to 9 to mirror longer-running multi-chunk ops seen on Android.
         """
         if not self._casaClient:
             raise RuntimeError("Not connected to network")
-        
-        # Get the unit
-        unit = self.units.get(unit_id)
-        if not unit:
-            raise ValueError(f"Unit {unit_id} not found")
-        
-        # Get current switch config
-        switch_config = unit.unitConfig.get("switchConfig", {})
-        buttons = switch_config.get("buttons", [])
-        
-        # Ensure we have enough buttons
-        while len(buttons) <= button_index:
-            buttons.append({})
-        
-        # Update the button configuration
-        button_config = buttons[button_index]
-        
-        if action_type == "none":
-            # Clear the button configuration - button does nothing
-            button_config = {}
-        elif action_type == "control_unit" and target_unit_id is not None:
-            # Configure button to control a specific unit
-            button_config["type"] = 0  # ControlUnit type
-            button_config["target"] = (target_unit_id << 8) | 1  # Unit target encoding
-            button_config["minDimLevel"] = 0.0
-        elif action_type == "scene":
-            button_config["type"] = 2  # Scene type
-            button_config["target"] = target_unit_id if target_unit_id else 1
-        elif action_type == "cycle_modes":
-            button_config["type"] = 1  # CycleModes type
-            button_config["includeOffUnits"] = True
-        else:
-            raise ValueError(f"Unknown action_type: {action_type}")
-        
-        # Update the buttons list
-        buttons[button_index] = button_config
-        switch_config["buttons"] = buttons
-        
-        # Convert to JSON and then to bytes
+
+        if seq < 0 or seq > 255:
+            raise ValueError("seq must be 0..255")
+        if len(chunk) > 61:
+            raise ValueError("chunk too large; max 61 bytes to fit ExtPacket payload")
+
+        payload = bytes([0x29, seq & 0xFF]) + chunk
+        target = (int(unit_id) << 8) | 0x01
+        opPkt = self._opContext.prepareOperation(
+            OpCode.ExtPacketSend,
+            target,
+            payload,
+            lifetime=lifetime,
+        )
+        await self._casaClient.send(opPkt)
+
+    async def start_switch_session(self, unit_id: int, *, payload: bytes = b"", lifetime: int = 9) -> None:
+        """Experimental: send AcquireSwitchSession (opcode 42).
+
+        Payload is device-specific and currently unknown for switchConfig; by default
+        sends an empty payload. Use for experimentation only until framing is confirmed.
+        """
+        if not self._casaClient:
+            raise RuntimeError("Not connected to network")
+        if len(payload) > 63:
+            raise ValueError("payload too large; max 63 bytes")
+        target = (int(unit_id) << 8) | 0x01
+        opPkt = self._opContext.prepareOperation(
+            OpCode.AcquireSwitchSession,
+            target,
+            payload,
+            lifetime=lifetime,
+        )
+        await self._casaClient.send(opPkt)
+
+    async def apply_switch_config_ble(self, unit_id: int, *, parameter_tag: int | None = None) -> None:
+        """Attempt to push the unit's switchConfig to the device over BLE.
+
+        This method currently supports only very small configurations that fit
+        into a single SetParameter payload (max 31 bytes after the tag).
+
+        Args:
+            unit_id: The ID of the unit to update.
+            parameter_tag: Optional override for the parameter tag; if not provided,
+                           a default of 1 is used (subject to device variation).
+
+        Raises:
+            RuntimeError: If not connected or no raw network data.
+            ValueError: If the encoded switchConfig is too large for SetParameter.
+        """
+        if not self._casaClient:
+            raise RuntimeError("Not connected to network")
+        if not self._casaNetwork or not self._casaNetwork.rawNetworkData:
+            raise RuntimeError("No raw network data available; connect and update first")
+
+        units = self._casaNetwork.rawNetworkData.get("network", {}).get("units", [])
+        unit_data = next((u for u in units if u.get("deviceID") == unit_id), None)
+        if not unit_data:
+            raise ValueError(f"Unit {unit_id} not found in raw network data")
+
+        switch_config = unit_data.get("switchConfig") or {}
+
         import json
-        config_json = json.dumps(switch_config, separators=(',', ':'))
-        config_bytes = config_json.encode('utf-8')
-        
-        # Find the parameter tag for switchConfig
-        # Based on Android analysis, switchConfig typically uses a specific tag
-        # This may need adjustment based on the actual device
-        SWITCH_CONFIG_TAG = 1  # This needs to be determined from the device
-        
-        # Send the parameter update
-        await self.setParameter(unit_id, SWITCH_CONFIG_TAG, config_bytes)
-        
-        self._logger.info(f"Updated button {button_index} on unit {unit_id} to {action_type} targeting {target_unit_id}")
+        config_bytes = json.dumps(switch_config, separators=(",", ":")).encode("utf-8")
+
+        # Protocol restriction: SetParameter accepts max 31 bytes after tag.
+        if len(config_bytes) > 31:
+            raise ValueError(
+                "switchConfig exceeds 31 bytes; multi-packet BLE apply is required. "
+                "This library will need an extended writer (AcquireSwitchSession/ExtPacketSend) to support large configs."
+            )
+
+        tag = 1 if parameter_tag is None else int(parameter_tag)
+        await self.setParameter(unit_id, tag, config_bytes)
+        self._logger.info(
+            "Applied switchConfig via SetParameter (tag=%s, bytes=%s) for unit %s",
+            tag,
+            len(config_bytes),
+            unit_id,
+        )
+
+    async def apply_switch_config_ble_large(self, unit_id: int) -> None:
+        """Experimental: attempt to push switchConfig using ExtPacketSend in chunks.
+
+        WARNING: Framing is not fully confirmed for switchConfig updates. This method
+        sends raw JSON bytes chunked as consecutive ExtPacket frames with header
+        [0x29][seq]. Use only for experimentation and logs; correctness is not guaranteed.
+        """
+        if not self._casaClient:
+            raise RuntimeError("Not connected to network")
+        if not self._casaNetwork or not self._casaNetwork.rawNetworkData:
+            raise RuntimeError("No raw network data available; connect and update first")
+
+        units = self._casaNetwork.rawNetworkData.get("network", {}).get("units", [])
+        unit_data = next((u for u in units if u.get("deviceID") == unit_id), None)
+        if not unit_data:
+            raise ValueError(f"Unit {unit_id} not found in raw network data")
+
+        switch_config = unit_data.get("switchConfig") or {}
+        import json
+        data = json.dumps(switch_config, separators=(",", ":")).encode("utf-8")
+
+        # Attempt to start a switch session before sending chunks. Some devices
+        # expect an AcquireSwitchSession (opcode 42) handshake prior to ExtPacketSend.
+        try:
+            await self.start_switch_session(unit_id)
+            self._logger.info("Started switch session (AcquireSwitchSession) for unit %s", unit_id)
+        except Exception as e:
+            # Non-fatal: proceed without session if device doesn't require it.
+            self._logger.info(
+                "AcquireSwitchSession not acknowledged or unsupported for unit %s (%s); proceeding with ExtPacketSend only.",
+                unit_id,
+                e,
+            )
+
+        # Chunk into 61-byte pieces (ExtPacket payload allows 63 total minus 2-byte header)
+        max_chunk = 61
+        seq = 0
+        for off in range(0, len(data), max_chunk):
+            chunk = data[off : off + max_chunk]
+            await self.send_ext_packet(unit_id, seq, chunk, lifetime=9)
+            self._logger.debug(
+                "ExtPacket chunk sent: unit=%s seq=%s size=%s/%s", unit_id, seq, len(chunk), len(data)
+            )
+            seq = (seq + 1) & 0xFF
+        self._logger.info(
+            "ExtPacket switchConfig attempt complete (unit=%s, total_bytes=%s, chunks=%s)",
+            unit_id,
+            len(data),
+            (len(data) + max_chunk - 1) // max_chunk,
+        )
+
+    async def update_button_config(
+        self,
+        unit_id: int,
+        button_index: int,
+        action_type: str,
+        target_id: int | None = None,
+        *,
+        exclusive_scenes: bool | None = None,
+        long_press_all_off: bool | None = None,
+        toggle_disabled: bool | None = None,
+    ) -> dict:
+        """Update one button entry in a unit's switchConfig in the cached network data.
+
+        Android mapping for actions (EnumC0105q):
+        - none -> 0, target 0
+        - scene -> 1, target=sceneID
+        - control_unit -> 2, target=deviceID
+        - control_group -> 3, target=groupID
+        - all_units -> 4, target=255
+        - resume_automation -> 6, target=0
+        - resume_automation_group -> 7, target=groupID
+
+        Returns the updated switchConfig dict.
+        """
+        if button_index < 0 or button_index > 7:
+            raise ValueError("button_index must be in range 0..7")
+
+        raw = self.rawNetworkData
+        if not raw:
+            raise RuntimeError("No raw network data loaded. Connect and update first.")
+
+        # Locate the unit's JSON entry
+        units = raw.get("network", {}).get("units", [])
+        unit_data = None
+        for u in units:
+            if u.get("deviceID") == unit_id:
+                unit_data = u
+                break
+        if not unit_data:
+            raise ValueError(f"Unit {unit_id} not found in raw network data")
+
+        switch_config = unit_data.get("switchConfig") or {}
+        buttons: list[dict] = switch_config.get("buttons") or []
+
+        action_map = {
+            "none": 0,
+            "scene": 1,
+            "control_unit": 2,
+            "control_group": 3,
+            "all_units": 4,
+            "resume_automation": 6,
+            "resume_automation_group": 7,
+        }
+        if action_type not in action_map:
+            raise ValueError(
+                "Unsupported action_type. Use one of: none, scene, control_unit, "
+                "control_group, all_units, resume_automation, resume_automation_group"
+            )
+        action_code = action_map[action_type]
+
+        if action_type == "all_units":
+            resolved_target = 255
+        elif action_type in ("none", "resume_automation"):
+            resolved_target = 0
+        else:
+            if target_id is None:
+                raise ValueError(f"target_id is required for action_type '{action_type}'")
+            resolved_target = int(target_id)
+
+        # Find or create entry for this button index
+        existing = None
+        for b in buttons:
+            if b.get("type") == button_index:
+                existing = b
+                break
+        entry = existing or {"type": button_index, "action": 0, "target": 0}
+        entry["action"] = action_code
+        entry["target"] = resolved_target
+        if not existing:
+            buttons.append(entry)
+
+        # Persist and apply optional flags
+        switch_config["buttons"] = buttons
+        if exclusive_scenes is not None:
+            switch_config["exclusiveScenes"] = bool(exclusive_scenes)
+        if long_press_all_off is not None:
+            switch_config["longPressAllOff"] = bool(long_press_all_off)
+        if toggle_disabled is not None:
+            switch_config["toggleDisabled"] = bool(toggle_disabled)
+
+        unit_data["switchConfig"] = switch_config
+
+        self._logger.info(
+            "Updated switchConfig (unit=%s, button=%s, action=%s, target=%s)",
+            unit_id,
+            button_index,
+            action_type,
+            resolved_target,
+        )
+
+        return switch_config
 
     async def disconnect(self) -> None:
         """Disconnect from the network."""

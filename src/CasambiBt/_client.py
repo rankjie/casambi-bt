@@ -497,11 +497,20 @@ class CasambiClient:
             f"Parsing incoming switch event packet #{packet_seq}... Data: {b2a(data)}"
         )
 
-        # Special handling for message type 0x29 - not a switch event
+        # Special handling for message type 0x29 - likely an extended/aux message
         if len(data) >= 1 and data[0] == 0x29:
-            self._logger.debug(
-                f"Ignoring message type 0x29 (not a switch event): {b2a(data)}"
-            )
+            # Log details so we can correlate with outgoing ExtPacketSend trials
+            if len(data) >= 3:
+                length = ((data[2] >> 4) & 15) + 1
+                parameter = data[2] & 15
+                payload = data[3 : 3 + min(length, max(0, len(data) - 3))]
+                self._logger.info(
+                    f"Ext-like message at packet head: flags=0x{data[1]:02x}, param={parameter}, payload={b2a(payload)}"
+                )
+            else:
+                self._logger.info(
+                    f"Ext-like message 0x29 at packet head with insufficient length: {b2a(data)}"
+                )
             return
 
         pos = 0
@@ -577,8 +586,10 @@ class CasambiClient:
                         raw_packet,
                     )
                 elif message_type == 0x29:
-                    # This shouldn't happen due to check above, but just in case
-                    self._logger.debug("Ignoring embedded type 0x29 message")
+                    # Extended/aux message embedded in switch event packet
+                    self._logger.info(
+                        f"Embedded 0x29 ext-like msg: flags=0x{flags:02x}, param=0x{parameter & 0x0F:01x}, payload={b2a(payload)}"
+                    )
                 elif message_type in [0x00, 0x06, 0x09, 0x1F, 0x2A]:
                     # Known non-switch message types - log at debug level
                     self._logger.debug(

@@ -12,6 +12,8 @@ class OpCode(IntEnum):
     SetColor = 7
     SetSlider = 12
     SetParameter = 26
+    AcquireSwitchSession = 42
+    ExtPacketSend = 43
     SetState = 48
     SetColorXY = 54
 
@@ -21,11 +23,19 @@ class OperationsContext:
         self.origin: int = 1
         self.lifetime: int = 5
 
-    def prepareOperation(self, op: OpCode, target: int, payload: bytes) -> bytes:
+    def prepareOperation(
+        self,
+        op: OpCode,
+        target: int,
+        payload: bytes,
+        *,
+        lifetime: int | None = None,
+    ) -> bytes:
         if len(payload) > 63:
             raise ValueError("Payload too long")
 
-        flags = (self.lifetime & 15) << 11 | len(payload)
+        lt = self.lifetime if lifetime is None else int(lifetime)
+        flags = (lt & 15) << 11 | len(payload)
 
         # Ensure that origin can't overflow.
         # TODO: Check that unsigned is actually correct here.
