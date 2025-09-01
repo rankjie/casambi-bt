@@ -233,18 +233,23 @@ class CasambiClient:
         self._callbackQueue.put_nowait((handle, data))
 
     async def _processCallbacks(self) -> None:
-        while True:
-            handle, data = await self._callbackQueue.get()
+        try:
+            while True:
+                handle, data = await self._callbackQueue.get()
 
-            # Try to loose any races here.
-            # Otherwise a state change caused by the last packet might not have been handled yet
-            await asyncio.sleep(0.001)
-            await self._activityLock.acquire()
-            try:
-                self._callbackMulitplexer(handle, data)
-            finally:
-                self._callbackQueue.task_done()
-                self._activityLock.release()
+                # Try to loose any races here.
+                # Otherwise a state change caused by the last packet might not have been handled yet
+                await asyncio.sleep(0.001)
+                await self._activityLock.acquire()
+                try:
+                    self._callbackMulitplexer(handle, data)
+                finally:
+                    self._callbackQueue.task_done()
+                    self._activityLock.release()
+        except asyncio.CancelledError:
+            # Task cancelled during shutdown; log at debug and exit cleanly.
+            self._logger.debug("Callback processing task cancelled during shutdown.")
+            raise
 
     def _callbackMulitplexer(
         self, handle: BleakGATTCharacteristic, data: bytes
@@ -759,8 +764,17 @@ class CasambiClient:
         self._logger.info("Disconnecting...")
 
         if self._callbackTask is not None:
+            # Cancel and await the background callback task to avoid
+            # 'Task was destroyed but it is pending' warnings.
             self._callbackTask.cancel()
-            self._callbackTask = None
+            try:
+                await self._callbackTask
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                self._logger.debug("Callback task finished with exception during disconnect.", exc_info=True)
+            finally:
+                self._callbackTask = None
 
         if self._gattClient is not None and self._gattClient.is_connected:
             try:
