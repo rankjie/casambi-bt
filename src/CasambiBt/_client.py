@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import struct
 from binascii import b2a_hex as b2a
@@ -183,8 +184,15 @@ class CasambiClient:
 
             # Device will initiate key exchange, so listen for that
             self._logger.debug("Starting notify")
+            notify_kwargs: dict[str, Any] = {}
+            notify_params = inspect.signature(self._gattClient.start_notify).parameters
+            if "bluez" in notify_params:
+                notify_kwargs["bluez"] = {"use_start_notify": True}
+
             await self._gattClient.start_notify(
-                CASA_AUTH_CHAR_UUID, self._queueCallback
+                CASA_AUTH_CHAR_UUID,
+                self._queueCallback,
+                **notify_kwargs,
             )
         finally:
             self._activityLock.release()

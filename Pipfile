@@ -4,7 +4,7 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-bleak = ">=0.22"
+bleak = ">=2.1.0"
 bleak-retry-connector = ">=3.6.0"
 cryptography = ">=40.0.0"
 httpx = ">=0.25"
