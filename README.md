@@ -1,9 +1,9 @@
 ![PyPI](https://img.shields.io/pypi/v/casambi-bt-revamped)
 [![Discord](https://img.shields.io/discord/1186445089317326888)](https://discord.gg/jgZVugfx)
 
-# Casambi Bluetooth Revamped - Enhanced Python library for Casambi networks
+# Casambi Bluetooth Revamped - Python library for Casambi networks
 
-This is an enhanced fork of the original [casambi-bt](https://github.com/lkempf/casambi-bt) library with additional features:
+This is a customized fork of the original [casambi-bt](https://github.com/lkempf/casambi-bt) library with additional features and should only be used for special needs:
 
 - **Switch event support** - Receive button press/release events from Casambi switches
 - **Improved relay status handling** - Better support for relay units

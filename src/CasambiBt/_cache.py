@@ -6,28 +6,28 @@ import shutil
 from types import TracebackType
 from typing import Final
 
-from aiopath import AsyncPath  # type: ignore
+from anyio import Path
 
 _LOGGER = logging.getLogger(__name__)
 
-CACHE_PATH_DEFAULT: Final = AsyncPath(os.getcwd()) / "casambi-bt-store"
+CACHE_PATH_DEFAULT: Final = Path(os.getcwd()) / "casambi-bt-store"
 CACHE_VERSION: Final = 2
 
-# We need a global lock since there could be multiple Caambi instances
+# We need a global lock since there could be multiple Casambi instances
 # with their own cache instances pointing to the same folder.
 _cacheLock = asyncio.Lock()
 
 
-def _blocking_delete(path: AsyncPath) -> None:
+def _blocking_delete(path: Path) -> None:
     shutil.rmtree(pathlib.Path(path))
 
 
 class Cache:
-    def __init__(self, cachePath: AsyncPath | pathlib.Path | None) -> None:
+    def __init__(self, cachePath: Path | pathlib.Path | None) -> None:
         if cachePath is None:
             self._cachePath = CACHE_PATH_DEFAULT
-        elif not isinstance(cachePath, AsyncPath):
-            self._cachePath = AsyncPath(cachePath)
+        elif not isinstance(cachePath, Path):
+            self._cachePath = Path(cachePath)
         else:
             self._cachePath = cachePath
 
@@ -69,7 +69,7 @@ class Cache:
             await self._cachePath.mkdir(mode=0o700)
             await self._cacheVersionFile.write_text(str(CACHE_VERSION))
 
-    async def __aenter__(self) -> AsyncPath:
+    async def __aenter__(self) -> Path:
         await _cacheLock.acquire()
 
         if self._uuid is None:
@@ -78,7 +78,7 @@ class Cache:
         try:
             await self._ensureCacheValid()
 
-            cacheDir = AsyncPath(self._cachePath / self._uuid)
+            cacheDir = Path(self._cachePath / self._uuid)
             if not await cacheDir.exists():
                 _LOGGER.debug("Creating cache entry for id %s", self._uuid)
                 await cacheDir.mkdir()
