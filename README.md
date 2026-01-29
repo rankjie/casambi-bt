@@ -5,7 +5,7 @@
 
 This is a customized fork of the original [casambi-bt](https://github.com/lkempf/casambi-bt) library with additional features and should only be used for special needs:
 
-- **Switch event support** - Receive button press/release events from Casambi switches
+- **Switch event support** - Receive button press/release/hold events from Casambi switches (wired + wireless)
 - **Improved relay status handling** - Better support for relay units
 - **Bug fixes and improvements** - Various fixes based on real-world usage
 
@@ -25,15 +25,38 @@ Have a look at `demo.py` for a small example.
 
 ### Switch Event Support
 
-This library now supports receiving switch button events:
+This library supports receiving physical switch events as a decoded stream of INVOCATION frames (ground truth from the official Android app).
+
+Event types you can expect:
+- `button_press`
+- `button_release`
+- `button_hold`
+- `button_release_after_hold`
+- `input_event` (raw NotifyInput frame that may accompany presses/holds; useful for diagnostics and some wired devices)
 
 ```python
 from CasambiBt import Casambi
 
 def handle_switch_event(event_data):
-    print(f"Switch event: Unit {event_data['unit_id']}, "
-          f"Button {event_data['button']}, "
-          f"Action: {event_data['event']}")
+    print(
+        "Switch event:",
+        {
+            "unit_id": event_data.get("unit_id"),
+            "button": event_data.get("button"),
+            "event": event_data.get("event"),
+            # INVOCATION metadata (useful for debugging/correlation)
+            "event_id": event_data.get("event_id"),
+            "opcode": event_data.get("opcode"),
+            "target_type": event_data.get("target_type"),
+            "origin": event_data.get("origin"),
+            "age": event_data.get("age"),
+            # NotifyInput fields (target_type=0x12)
+            "input_code": event_data.get("input_code"),
+            "input_channel": event_data.get("input_channel"),
+            "input_value16": event_data.get("input_value16"),
+            "input_mapped_event": event_data.get("input_mapped_event"),
+        },
+    )
 
 casa = Casambi()
 # ... connect to network ...
@@ -43,6 +66,13 @@ casa.registerSwitchEventHandler(handle_switch_event)
 
 # Events will be received when buttons are pressed/released
 ```
+
+Notes:
+- Wireless (battery) switches typically send a "button stream" (target_type `0x06`) for press/release, and a NotifyInput stream (target_type `0x12`) for hold/release-after-hold.
+- Wired switches often only send NotifyInput (target_type `0x12`), so `input_code` is mapped into `button_press/button_release/...` when appropriate.
+- The library suppresses same-state retransmits at the protocol layer (edge detection), so Home Assistant-style time-window deduplication should generally not be necessary.
+
+For the parsing details and field layout, see `doc/PROTOCOL_PARSING.md`.
 
 ### MacOS
 
@@ -58,3 +88,12 @@ If you have problems connecting to the network please check that your network is
 ![Gateway settings](/doc/img/gateway.png)
 ![Network settings](/doc/img/network.png)
 ![Performance settings](/doc/img/perf.png)
+
+## Development / Offline Testing
+
+This repo includes log-driven unit tests for switch parsing:
+
+```bash
+cd casambi-bt
+python -m unittest -v
+```
