@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import logging
+import platform
 import struct
 from binascii import b2a_hex as b2a
 from collections.abc import Callable
@@ -24,6 +25,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from ._constants import CASA_AUTH_CHAR_UUID, ConnectionState
 from ._encryption import Encryptor
 from ._network import Network
+from ._switch_events import SwitchEventStreamDecoder
 
 # We need to move these imports here to prevent a cycle.
 from .errors import (  # noqa: E402
@@ -43,7 +45,7 @@ class IncommingPacketType(IntEnum):
 
 
 MIN_VERSION: Final[int] = 10
-MAX_VERSION: Final[int] = 10
+MAX_VERSION: Final[int] = 11
 
 
 class CasambiClient:
@@ -79,6 +81,7 @@ class CasambiClient:
             else address_or_device
         )
         self._logger = logging.getLogger(__name__)
+        self._switchDecoder = SwitchEventStreamDecoder(self._logger)
         self._connectionState: ConnectionState = ConnectionState.NONE
         self._dataCallback = dataCallback
         self._disconnectedCallback = disonnectedCallback
@@ -121,6 +124,33 @@ class CasambiClient:
             if isinstance(self._address_or_devive, BLEDevice)
             else await get_device(self.address)
         )
+
+        if not device and isinstance(self._address_or_devive, str) and platform.system() == "Darwin":
+            # macOS CoreBluetooth typically reports random per-device identifiers as addresses
+            # unless `use_bdaddr` is enabled. Our `discover()` uses that flag so try it here.
+            try:
+                from ._discover import discover as discover_networks  # local import to avoid cycles
+
+                networks = await discover_networks()
+                wanted = self.address.replace(":", "").lower()
+                for d in networks:
+                    if d.address.replace(":", "").lower() == wanted:
+                        device = d
+                        break
+
+                if not device:
+                    self._logger.warning(
+                        "macOS BLE lookup by address failed. Discovered %d Casambi networks, but none match %s. Discovered=%s",
+                        len(networks),
+                        self.address,
+                        [d.address for d in networks[:10]],
+                    )
+            except Exception:
+                self._logger.debug(
+                    "macOS fallback discovery failed while trying to find %s.",
+                    self.address,
+                    exc_info=True,
+                )
 
         if not device:
             self._logger.error("Failed to discover client.")
@@ -453,6 +483,19 @@ class CasambiClient:
         if packetType == IncommingPacketType.UnitState:
             self._parseUnitStates(decrypted_data[1:])
         elif packetType == IncommingPacketType.SwitchEvent:
+            # Stable logs for offline analysis: packet seq + encrypted + decrypted.
+            # (Decrypted data includes the leading packet type byte.)
+            self._logger.info(
+                "[CASAMBI_RAW_PACKET] Encrypted #%s: %s",
+                device_sequence,
+                b2a(raw_encrypted_packet),
+            )
+            self._logger.info(
+                "[CASAMBI_DECRYPTED] Type=%d #%s: %s",
+                packetType,
+                device_sequence,
+                b2a(decrypted_data),
+            )
             # Pass the device sequence as the packet sequence for consumers,
             # and still include the raw encrypted packet for diagnostics.
             seq_for_consumer = device_sequence if device_sequence is not None else self._inPacketCount
@@ -515,138 +558,47 @@ class CasambiClient:
     def _parseSwitchEvent(
         self, data: bytes, packet_seq: int = None, raw_packet: bytes = None
     ) -> None:
-        """Parse switch event packet which contains multiple message types."""
+        """Parse decrypted packet type=7 payload (INVOCATION stream).
+
+        Ground truth: casambi-android `v1.C1775b.Q(Q2.h)` parses decrypted packet type=7
+        as a stream of INVOCATION frames. Switch button events are INVOCATIONs.
+        """
+
         self._logger.info(
-            f"Parsing incoming switch event packet #{packet_seq}... Data: {b2a(data)}"
+            "Parsing incoming switch event packet #%s... Data: %s",
+            packet_seq,
+            b2a(data),
+        )
+        self._logger.info(
+            "[CASAMBI_SWITCH_PACKET] Full data #%s: hex=%s len=%d",
+            packet_seq,
+            b2a(data),
+            len(data),
         )
 
-        # Special handling for message type 0x29 - likely an extended/aux message
-        if len(data) >= 1 and data[0] == 0x29:
-            # Log details so we can correlate with outgoing ExtPacketSend trials
-            if len(data) >= 3:
-                length = ((data[2] >> 4) & 15) + 1
-                parameter = data[2] & 15
-                payload = data[3 : 3 + min(length, max(0, len(data) - 3))]
-                self._logger.info(
-                    f"Ext-like message at packet head: flags=0x{data[1]:02x}, param={parameter}, payload={b2a(payload)}"
-                )
-            else:
-                self._logger.info(
-                    f"Ext-like message 0x29 at packet head with insufficient length: {b2a(data)}"
-                )
-            return
+        events, stats = self._switchDecoder.decode(
+            data,
+            packet_seq=packet_seq,
+            raw_packet=raw_packet,
+            arrival_sequence=self._inPacketCount,
+        )
 
-        pos = 0
-        oldPos = 0
-        switch_events_found = 0
+        self._logger.info(
+            "[CASAMBI_SWITCH_SUMMARY] packet=%s frames=%d button_frames=%d input_frames=%d ignored=%d emitted=%d suppressed_same_state=%d",
+            packet_seq,
+            stats.frames_total,
+            stats.frames_button,
+            stats.frames_input,
+            stats.frames_ignored,
+            stats.events_emitted,
+            stats.events_suppressed_same_state,
+        )
 
-        try:
-            while pos <= len(data) - 3:
-                oldPos = pos
-
-                # Parse message header
-                message_type = data[pos]
-                flags = data[pos + 1]
-                length = ((data[pos + 2] >> 4) & 15) + 1
-                parameter = data[pos + 2]  # Full byte, not just lower 4 bits
-                pos += 3
-
-                # Sanity check: message type should be reasonable
-                if message_type > 0x80:
-                    self._logger.debug(
-                        f"Skipping invalid message type 0x{message_type:02x} at position {oldPos}"
-                    )
-                    # Try to resync by looking for next valid message
-                    pos = oldPos + 1
-                    continue
-
-                # Check if we have enough data for the payload
-                if pos + length > len(data):
-                    self._logger.debug(
-                        f"Incomplete message at position {oldPos}. "
-                        f"Type: 0x{message_type:02x}, declared length: {length}, available: {len(data) - pos}"
-                    )
-                    break
-
-                # Extract the payload
-                payload = data[pos : pos + length]
-                pos += length
-
-                # Process based on message type
-                if message_type == 0x08 or message_type == 0x10:  # Switch/button events
-                    switch_events_found += 1
-                    
-                    # Button extraction differs between type 0x08 and type 0x10
-                    if message_type == 0x08:
-                        # For type 0x08, the lower nibble is a code that maps to physical button id
-                        # Using formula: ((code + 2) % 4) + 1 based on reverse engineering findings
-                        code_nibble = parameter & 0x0F
-                        button = ((code_nibble + 2) % 4) + 1
-                        self._logger.debug(
-                            f"Type 0x08 button extraction: parameter=0x{parameter:02x}, code={code_nibble}, button={button}"
-                        )
-                    else:
-                        # For type 0x10, use existing logic
-                        button_lower = parameter & 0x0F
-                        button_upper = (parameter >> 4) & 0x0F
-
-                        # Use upper 4 bits if lower 4 bits are 0, otherwise use lower 4 bits
-                        if button_lower == 0 and button_upper != 0:
-                            button = button_upper
-                            self._logger.debug(
-                                f"Type 0x10 button extraction: parameter=0x{parameter:02x}, using upper nibble, button={button}"
-                            )
-                        else:
-                            button = button_lower
-                            self._logger.debug(
-                                f"Type 0x10 button extraction: parameter=0x{parameter:02x}, using lower nibble, button={button}"
-                            )
-
-                    # For type 0x10 messages, we need to pass additional data beyond the declared payload
-                    if message_type == 0x10:
-                        # Extend to include at least 10 bytes from message start for state byte
-                        extended_end = min(oldPos + 11, len(data))
-                        full_message_data = data[oldPos:extended_end]
-                    else:
-                        full_message_data = data
-                    self._processSwitchMessage(
-                        message_type,
-                        flags,
-                        button,
-                        payload,
-                        full_message_data,
-                        oldPos,
-                        packet_seq,
-                        raw_packet,
-                    )
-                elif message_type == 0x29:
-                    # Extended/aux message embedded in switch event packet
-                    self._logger.info(
-                        f"Embedded 0x29 ext-like msg: flags=0x{flags:02x}, param=0x{parameter & 0x0F:01x}, payload={b2a(payload)}"
-                    )
-                elif message_type in [0x00, 0x06, 0x09, 0x1F, 0x2A]:
-                    # Known non-switch message types - log at debug level
-                    self._logger.debug(
-                        f"Non-switch message type 0x{message_type:02x}: flags=0x{flags:02x}, "
-                        f"param={parameter}, payload={b2a(payload)}"
-                    )
-                else:
-                    # Unknown message types - log at info level
-                    self._logger.info(
-                        f"Unknown message type 0x{message_type:02x}: flags=0x{flags:02x}, "
-                        f"param={parameter}, payload={b2a(payload)}"
-                    )
-
-                oldPos = pos
-
-        except IndexError:
-            self._logger.error(
-                f"Ran out of data while parsing switch event packet! "
-                f"Remaining data {b2a(data[oldPos:])} in {b2a(data)}."
-            )
-
-        if switch_events_found == 0:
-            self._logger.debug(f"No switch events found in packet: {b2a(data)}")
+        for ev in events:
+            # Back-compat alias: older consumers looked for 'flags'
+            if "flags" not in ev:
+                ev["flags"] = ev.get("invocation_flags")
+            self._dataCallback(IncommingPacketType.SwitchEvent, ev)
 
     def _processSwitchMessage(
         self,

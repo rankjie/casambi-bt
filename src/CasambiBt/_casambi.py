@@ -473,13 +473,16 @@ class Casambi:
         """Register a new handler for switch events.
 
         This handler is called whenever a switch event is received.
-        The handler is supplied with a dictionary containing:
-        - unit_id: The ID of the switch unit
-        - button: The button number that was pressed/released
-        - event: Either "button_press" or "button_release"
-        - message_type: The raw message type (0x08 or 0x10)
-        - flags: Additional flags from the message
-        - extra_data: Any additional data from the message
+        The handler is supplied with a dictionary containing (at minimum):
+        - unit_id: target unit id (from INVOCATION target high byte)
+        - button: best-effort "label" (typically 1..4 for 4-gang switches)
+        - event: "button_press" | "button_release" | "input_event"
+
+        Switch events are parsed from decrypted packet type=7 (INVOCATION stream),
+        matching casambi-android `v1.C1775b.Q(Q2.h)`. Extra diagnostic keys include:
+        - invocation_flags, opcode, origin, target, target_type, age, origin_handle
+        - button_event_index (0..7), param_p, param_s
+        - packet_sequence, arrival_sequence, raw_packet, decrypted_data, payload_hex, frame_offset, event_id
 
         :param handler: The method to call when a switch event is received.
         """
