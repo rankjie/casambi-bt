@@ -482,6 +482,7 @@ class Casambi:
         matching casambi-android `v1.C1775b.Q(Q2.h)`. Extra diagnostic keys include:
         - invocation_flags, opcode, origin, target, target_type, age, origin_handle
         - button_event_index (0..7), param_p, param_s
+        - input_index (0..7), input_code, input_b1, input_channel, input_value16, input_mapped_event
         - packet_sequence, arrival_sequence, raw_packet, decrypted_data, payload_hex, frame_offset, event_id
 
         :param handler: The method to call when a switch event is received.

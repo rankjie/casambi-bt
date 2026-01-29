@@ -3,7 +3,7 @@ from binascii import b2a_hex as b2a
 from colorsys import hsv_to_rgb, rgb_to_hsv
 from dataclasses import dataclass
 from enum import Enum, unique
-from typing import Final
+from typing import Any, Final
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -112,6 +112,39 @@ class UnitState:
         self._xy: tuple[float, float] | None = None
         self._slider: int | None = None
         self._onoff: bool | None = None
+        # Last raw state bytes, as received from the network.
+        self._raw_state: bytes | None = None
+        # Unknown controls that we don't have semantic parsing for yet.
+        # Items are (offset_bits, length_bits, value_int).
+        self._unknown_controls: list[tuple[int, int, int]] = []
+
+    @property
+    def raw_state(self) -> bytes | None:
+        return self._raw_state
+
+    @property
+    def unknown_controls(self) -> list[tuple[int, int, int]]:
+        # Expose a copy so callers can't mutate internal tracking.
+        return list(self._unknown_controls)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a stable, JSON-friendly representation for diagnostics."""
+        return {
+            "dimmer": self.dimmer,
+            "vertical": self.vertical,
+            "rgb": self.rgb,
+            "white": self.white,
+            "temperature": self.temperature,
+            "colorsource": self.colorsource.name if self.colorsource is not None else None,
+            "xy": self.xy,
+            "slider": self.slider,
+            "onoff": self.onoff,
+            "raw_state_hex": b2a(self._raw_state).decode("ascii") if self._raw_state is not None else None,
+            "unknown_controls": [
+                {"offset": off, "length": length, "value": val}
+                for (off, length, val) in self._unknown_controls
+            ],
+        }
 
     def _check_range(
         self, value: int | float, min: int | float, max: int | float
@@ -429,6 +462,8 @@ class Unit:
         """
         if not self._state:
             self._state = UnitState()
+        self._state._raw_state = value
+        self._state._unknown_controls = []
 
         # TODO: Support for resolutions >8 byte?
         for c in self.unitType.controls:
@@ -500,6 +535,7 @@ class Unit:
                 _LOGGER.debug(
                     f"Value for unkown control type at {c.offset}: {cInt}. Unit type is {self.unitType.id}."
                 )
+                self._state._unknown_controls.append((c.offset, c.length, cInt))
 
         _LOGGER.debug(f"Parsed {b2a(value)} to {self.state.__repr__()}")
 
