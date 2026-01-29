@@ -147,18 +147,19 @@ class SwitchEventStreamDecoder:
             # Stable identifier for consumers to deduplicate further if needed.
             event_id = f"invoke:{frame.origin:04x}:{frame.age:04x}:{frame.opcode:02x}:{frame.target:04x}"
 
-            self._logger.info(
-                "[CASAMBI_BUTTON_EVENT] packet=%s unit=%d button=%d event=%s opcode=0x%02x origin=0x%04x age=0x%04x flags=0x%04x payload=%s",
-                packet_seq,
-                unit_id,
-                button,
-                event,
-                frame.opcode,
-                frame.origin,
-                frame.age,
-                frame.flags,
-                b2a(frame.payload),
-            )
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug(
+                    "[CASAMBI_BUTTON_EVENT] packet=%s unit=%d button=%d event=%s opcode=0x%02x origin=0x%04x age=0x%04x flags=0x%04x payload=%s",
+                    packet_seq,
+                    unit_id,
+                    button,
+                    event,
+                    frame.opcode,
+                    frame.origin,
+                    frame.age,
+                    frame.flags,
+                    b2a(frame.payload),
+                )
 
             return {
                 # Back-compat / existing consumers
@@ -252,19 +253,20 @@ class SwitchEventStreamDecoder:
                     return None
                 self._last_input_code[state_key] = input_code
 
-                self._logger.info(
-                    "[CASAMBI_INPUT_AS_BUTTON] packet=%s unit=%d button=%d event=%s code=0x%02x opcode=0x%02x origin=0x%04x age=0x%04x flags=0x%04x payload=%s",
-                    packet_seq,
-                    unit_id,
-                    button,
-                    mapped_event,
-                    input_code,
-                    frame.opcode,
-                    frame.origin,
-                    frame.age,
-                    frame.flags,
-                    b2a(frame.payload),
-                )
+                if self._logger.isEnabledFor(logging.DEBUG):
+                    self._logger.debug(
+                        "[CASAMBI_INPUT_AS_BUTTON] packet=%s unit=%d button=%d event=%s code=0x%02x opcode=0x%02x origin=0x%04x age=0x%04x flags=0x%04x payload=%s",
+                        packet_seq,
+                        unit_id,
+                        button,
+                        mapped_event,
+                        input_code,
+                        frame.opcode,
+                        frame.origin,
+                        frame.age,
+                        frame.flags,
+                        b2a(frame.payload),
+                    )
             event = mapped_event or "input_event"
             self._logger.debug(
                 "[CASAMBI_INPUT_EVENT] packet=%s unit=%d input=%d opcode=0x%02x origin=0x%04x age=0x%04x flags=0x%04x code=%s ch=%s val=%s payload=%s",

@@ -478,24 +478,28 @@ class CasambiClient:
             return
 
         packetType = decrypted_data[0]
-        self._logger.debug(f"Incoming data of type {packetType}: {b2a(decrypted_data)}")
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
+                "Incoming data of type %d: %s", packetType, b2a(decrypted_data)
+            )
 
         if packetType == IncommingPacketType.UnitState:
             self._parseUnitStates(decrypted_data[1:])
         elif packetType == IncommingPacketType.SwitchEvent:
             # Stable logs for offline analysis: packet seq + encrypted + decrypted.
             # (Decrypted data includes the leading packet type byte.)
-            self._logger.info(
-                "[CASAMBI_RAW_PACKET] Encrypted #%s: %s",
-                device_sequence,
-                b2a(raw_encrypted_packet),
-            )
-            self._logger.info(
-                "[CASAMBI_DECRYPTED] Type=%d #%s: %s",
-                packetType,
-                device_sequence,
-                b2a(decrypted_data),
-            )
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug(
+                    "[CASAMBI_RAW_PACKET] Encrypted #%s: %s",
+                    device_sequence,
+                    b2a(raw_encrypted_packet),
+                )
+                self._logger.debug(
+                    "[CASAMBI_DECRYPTED] Type=%d #%s: %s",
+                    packetType,
+                    device_sequence,
+                    b2a(decrypted_data),
+                )
             # Pass the device sequence as the packet sequence for consumers,
             # and still include the raw encrypted packet for diagnostics.
             seq_for_consumer = device_sequence if device_sequence is not None else self._inPacketCount
@@ -509,13 +513,14 @@ class CasambiClient:
             # In the future we might want to parse the revision and issue a warning if there is a mismatch.
             pass
         else:
-            self._logger.info(f"Packet type {packetType} not implemented. Ignoring!")
+            self._logger.debug("Packet type %d not implemented. Ignoring!", packetType)
 
     def _parseUnitStates(self, data: bytes) -> None:
         # Ground truth: casambi-android `v1.C1775b.V(Q2.h)` parses decrypted packet type=6
         # as a stream of unit state records. Records have optional bytes depending on flags.
-        self._logger.info("Parsing incoming unit states...")
-        self._logger.debug("Incoming unit state: %s", b2a(data))
+        self._logger.debug("Parsing incoming unit states...")
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug("Incoming unit state: %s", b2a(data))
 
         pos = 0
         oldPos = 0
@@ -559,19 +564,20 @@ class CasambiClient:
                 padding = data[pos : pos + padding_len] if padding_len else b""
                 pos += padding_len
 
-                self._logger.debug(
-                    "[CASAMBI_UNITSTATE_PARSED] unit=%d flags=0x%02x prio=%d online=%s on=%s con=%s sid=%s extra_byte=%d state=%s padding=%s",
-                    unit_id,
-                    flags,
-                    prio,
-                    online,
-                    on,
-                    con,
-                    sid,
-                    extra_byte,
-                    b2a(state),
-                    b2a(padding),
-                )
+                if self._logger.isEnabledFor(logging.DEBUG):
+                    self._logger.debug(
+                        "[CASAMBI_UNITSTATE_PARSED] unit=%d flags=0x%02x prio=%d online=%s on=%s con=%s sid=%s extra_byte=%d state=%s padding=%s",
+                        unit_id,
+                        flags,
+                        prio,
+                        online,
+                        on,
+                        con,
+                        sid,
+                        extra_byte,
+                        b2a(state),
+                        b2a(padding),
+                    )
 
                 self._dataCallback(
                     IncommingPacketType.UnitState,
@@ -609,17 +615,19 @@ class CasambiClient:
         as a stream of INVOCATION frames. Switch button events are INVOCATIONs.
         """
 
-        self._logger.info(
-            "Parsing incoming switch event packet #%s... Data: %s",
-            packet_seq,
-            b2a(data),
-        )
-        self._logger.info(
-            "[CASAMBI_SWITCH_PACKET] Full data #%s: hex=%s len=%d",
-            packet_seq,
-            b2a(data),
-            len(data),
-        )
+        if self._logger.isEnabledFor(logging.DEBUG):
+            data_hex = b2a(data)
+            self._logger.debug(
+                "Parsing incoming switch event packet #%s... Data: %s",
+                packet_seq,
+                data_hex,
+            )
+            self._logger.debug(
+                "[CASAMBI_SWITCH_PACKET] Full data #%s: hex=%s len=%d",
+                packet_seq,
+                data_hex,
+                len(data),
+            )
 
         events, stats = self._switchDecoder.decode(
             data,
@@ -628,7 +636,7 @@ class CasambiClient:
             arrival_sequence=self._inPacketCount,
         )
 
-        self._logger.info(
+        self._logger.debug(
             "[CASAMBI_SWITCH_SUMMARY] packet=%s frames=%d button_frames=%d input_frames=%d ignored=%d emitted=%d suppressed_same_state=%d",
             packet_seq,
             stats.frames_total,
