@@ -400,7 +400,7 @@ class Casambi:
     def _dataCallback(
         self, packetType: IncommingPacketType, data: dict[str, Any]
     ) -> None:
-        self._logger.info(f"Incomming data callback of type {packetType}")
+        self._logger.debug("Incomming data callback of type %s", packetType)
         if packetType == IncommingPacketType.UnitState:
             self._logger.debug(
                 f"Handling changed state {b2a(data['state'])} for unit {data['id']}"
