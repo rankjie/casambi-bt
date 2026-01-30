@@ -207,19 +207,23 @@ class CasambiClient:
         self._logger.info(f"Connected to {self.address}")
         self._connectionState = ConnectionState.CONNECTED
 
-        # Detect protocol mode by available characteristics.
-        services = await self._gattClient.get_services()
+        # Detect protocol mode.
+        #
+        # Important: Home Assistant wraps BleakClient (HaBleakClientWrapper) which does not implement
+        # `get_services()`. Therefore we use "try-read" probing instead of enumerating GATT services.
+        #
+        # Order:
+        #  1) Classic "non-conformant": CA51 (hash) + CA52 (data channel)
+        #  2) EVO: auth char read starts with 0x01 (NodeInfo)
+        #  3) Classic "conformant": auth char read returns connection hash (first 8 bytes used)
 
-        def _has_char(uuid: str) -> bool:
-            uuid_l = uuid.lower()
-            for s in services:
-                for c in s.characteristics:
-                    if c.uuid.lower() == uuid_l:
-                        return True
-            return False
+        classic_hash: bytes | None = None
+        try:
+            classic_hash = await self._gattClient.read_gatt_char(CASA_CLASSIC_HASH_CHAR_UUID)
+        except Exception:
+            classic_hash = None
 
-        # Classic (non-conformant) uses CA51 (connection hash) + CA52 (data channel).
-        if _has_char(CASA_CLASSIC_HASH_CHAR_UUID) and _has_char(CASA_CLASSIC_DATA_CHAR_UUID):
+        if classic_hash and len(classic_hash) >= 8:
             if os.getenv("CASAMBI_BT_DISABLE_CLASSIC", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
                 raise ProtocolError("Classic protocol detected but disabled via CASAMBI_BT_DISABLE_CLASSIC=1")
 
@@ -232,7 +236,7 @@ class CasambiClient:
             self._dataCharUuid = CASA_CLASSIC_DATA_CHAR_UUID
 
             # Read connection hash (first 8 bytes are used for CMAC signing).
-            raw_hash = await self._gattClient.read_gatt_char(CASA_CLASSIC_HASH_CHAR_UUID)
+            raw_hash = classic_hash
             if raw_hash is None or len(raw_hash) < 8:
                 raise ClassicHandshakeError(
                     f"Classic connection hash read failed/too short (len={0 if raw_hash is None else len(raw_hash)})."
@@ -247,34 +251,48 @@ class CasambiClient:
             notify_params = inspect.signature(self._gattClient.start_notify).parameters
             if "bluez" in notify_params:
                 notify_kwargs["bluez"] = {"use_start_notify": True}
-            await self._gattClient.start_notify(
-                CASA_CLASSIC_DATA_CHAR_UUID,
-                self._queueCallback,
-                **notify_kwargs,
-            )
-
-            # Classic has no EVO-style key exchange/auth; we can send immediately.
-            self._connectionState = ConnectionState.AUTHENTICATED
-            self._logger.info("Protocol mode selected: CLASSIC")
-            if self._logger.isEnabledFor(logging.DEBUG):
-                self._logger.debug(
-                    "[CASAMBI_CLASSIC_CONN_HASH] len=%d hash=%s",
-                    len(self._classicConnHash8),
-                    b2a(self._classicConnHash8),
+            try:
+                await self._gattClient.start_notify(
+                    CASA_CLASSIC_DATA_CHAR_UUID,
+                    self._queueCallback,
+                    **notify_kwargs,
                 )
-            return
-
-        # Conformant devices can expose the Classic signed channel on the EVO-style UUID too.
-        if _has_char(CASA_AUTH_CHAR_UUID):
-            first = await self._gattClient.read_gatt_char(CASA_AUTH_CHAR_UUID)
-            if first and len(first) >= 2 and first[0] == 0x01:
-                # EVO NodeInfo packet starts with 0x01.
-                self._protocolMode = ProtocolMode.EVO
-                self._dataCharUuid = CASA_AUTH_CHAR_UUID
-                self._checkProtocolVersion(self._network.protocolVersion)
-                self._logger.info("Protocol mode selected: EVO")
+            except Exception as e:
+                # Some firmwares may expose Classic signing on the EVO UUID instead.
+                # Fall through to auth-char probing if CA52 isn't available.
+                self._logger.debug("Classic CA52 notify failed; trying auth UUID probing.", exc_info=True)
+                self._protocolMode = None
+                self._dataCharUuid = None
+                self._classicConnHash8 = None
+                # continue detection below
+            else:
+                # Classic has no EVO-style key exchange/auth; we can send immediately.
+                self._connectionState = ConnectionState.AUTHENTICATED
+                self._logger.info("Protocol mode selected: CLASSIC")
+                if self._logger.isEnabledFor(logging.DEBUG):
+                    self._logger.debug(
+                        "[CASAMBI_CLASSIC_CONN_HASH] len=%d hash=%s",
+                        len(self._classicConnHash8),
+                        b2a(self._classicConnHash8),
+                    )
                 return
 
+        # Conformant devices can expose the Classic signed channel on the EVO-style UUID too.
+        first: bytes | None = None
+        try:
+            first = await self._gattClient.read_gatt_char(CASA_AUTH_CHAR_UUID)
+        except Exception:
+            first = None
+
+        if first and len(first) >= 2 and first[0] == 0x01:
+            # EVO NodeInfo packet starts with 0x01.
+            self._protocolMode = ProtocolMode.EVO
+            self._dataCharUuid = CASA_AUTH_CHAR_UUID
+            self._checkProtocolVersion(self._network.protocolVersion)
+            self._logger.info("Protocol mode selected: EVO")
+            return
+
+        if first is not None:
             # Otherwise, treat as Classic conformant: read provides connection hash.
             if os.getenv("CASAMBI_BT_DISABLE_CLASSIC", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
                 raise ProtocolError("Classic protocol detected but disabled via CASAMBI_BT_DISABLE_CLASSIC=1")
@@ -282,9 +300,9 @@ class CasambiClient:
                 raise ClassicKeysMissingError(
                     "Classic protocol detected but network has no visitorKey/managerKey."
                 )
-            if first is None or len(first) < 8:
+            if len(first) < 8:
                 raise ClassicHandshakeError(
-                    f"Classic connection hash read failed/too short (len={0 if first is None else len(first)})."
+                    f"Classic connection hash read failed/too short (len={len(first)})."
                 )
 
             self._protocolMode = ProtocolMode.CLASSIC
@@ -313,7 +331,7 @@ class CasambiClient:
             return
 
         raise ProtocolError(
-            "No supported Casambi characteristics found (Classic ca51/ca52 or EVO/Classic conformant auth char)."
+            "No supported Casambi characteristics found (Classic ca51/ca52 or EVO/Classic-conformant auth char)."
         )
 
     def _on_disconnect(self, client: BleakClient) -> None:
