@@ -6,6 +6,30 @@ Ground truth (Android):
 - INVOCATION stream parsing: `casambi-android/sources/V1/C1775b.java` method `Q(Q2.h)`
 - Unit state parsing: `casambi-android/sources/V1/C1775b.java` method `V(Q2.h)`
 - Function opcode ordinals: `casambi-android/sources/V1/EnumC1777d.java`
+- Classic GATT UUIDs: `casambi-android/sources/t1/C1713d.java` (UUIDs `ca5a/ca51/ca52`)
+- Classic signed header + CMAC: `casambi-android/sources/t1/P.java` method `o(...)`
+- Classic command record encoding: `casambi-android/sources/u1/C1753e.java` method `a(P)`
+- Classic command ordinals: `casambi-android/sources/u1/EnumC1754f.java`
+
+## Protocol Variants: EVO vs Classic
+
+Casambi has two protocol families on BLE:
+
+- **EVO (Evolution firmware)**: encrypted channel + decrypted packet types (`0x06`, `0x07`, `0x09`).
+- **Classic (legacy firmware)**: a **CMAC-signed** data channel; commands are sent as "command records".
+
+This library:
+- Supports **EVO** parsing and switch events (packet types `0x06/0x07/0x09`).
+- Supports **Classic** for **unit control** (experimental; relies on keys from cloud JSON `visitorKey`/`managerKey` and on-device GATT signing).
+
+Protocol selection is automatic at runtime based on the connected device's GATT:
+- If the device exposes `ca51` + `ca52`, it is treated as Classic.
+- Otherwise, if `CASA_AUTH_CHAR_UUID` (`c9ffde48-...`) is readable:
+  - If the first byte is `0x01` (NodeInfo), it is EVO.
+  - Otherwise it is treated as "Classic conformant" (Classic signed channel on the EVO UUID).
+
+Implementation:
+- `casambi-bt/src/CasambiBt/_client.py` `CasambiClient.connect()` chooses `ProtocolMode`.
 
 ## Decrypted Packet Types
 
@@ -139,3 +163,72 @@ Log-driven tests:
 - `casambi-bt/tests/test_switch_event_logs.py`
 - `casambi-bt/tests/test_unit_state_logs.py`
 
+## Classic: Signed Channel + Command Records (Experimental)
+
+### Classic GATT UUIDs
+
+Classic devices use different UUIDs than EVO (ground truth: `t1.C1713d`):
+- Service UUID: `0000ca5a-0000-1000-8000-00805f9b34fb`
+- Connection hash characteristic: `0000ca51-0000-1000-8000-00805f9b34fb`
+- Signed data characteristic (write + notify): `0000ca52-0000-1000-8000-00805f9b34fb`
+
+Some devices expose the Classic signed data channel on the EVO auth characteristic UUID
+(`c9ffde48-ca5a-0001-ab83-8f519b482f77`). The library supports both variants.
+
+### Classic Signed Frame Layout
+
+Classic frames are signed with AES-CMAC; the CMAC (or a prefix) is embedded into the header.
+
+Header layout (ground truth: `t1.P.n(...)` + `t1.P.o(...)`):
+- `auth_level` (1 byte):
+  - `0x02` = visitor (4-byte signature prefix)
+  - `0x03` = manager (16-byte signature prefix)
+- `sig_prefix` (`sig_len` bytes): placeholder filled with CMAC prefix
+- `seq` (2 bytes, big-endian): included in CMAC input
+- `payload` (remaining bytes): command record stream
+
+CMAC input (ground truth: `t1.P.o(...)`):
+- `connection_hash[0:8] + (seq || payload)`
+
+### Classic Command Record Encoding
+
+Classic control commands are encoded as records (ground truth: `u1.C1753e.a(P)`):
+
+Record layout:
+- `b0`: encoded length byte: `(record_len + 239) & 0xFF`
+- `b1`: `ordinal | flags`
+  - `flags & 0x40`: `div` byte present
+  - `flags & 0x80`: `target_id` byte present
+  - `ordinal = b1 & 0x3F`
+- `div` (1 byte, usually present; Android increments 1..255)
+- `target_id` (1 byte, optional; Android only writes when `> 0`)
+- `lifetime` (1 byte, Android uses `200`)
+- `payload` (0..N bytes; command-specific)
+
+The library builds records via:
+- `casambi-bt/src/CasambiBt/_client.py` `CasambiClient.buildClassicCommand(...)`
+
+### Classic Control Coverage
+
+The high-level `Casambi` APIs map to Classic command ordinals (ground truth: `u1.EnumC1754f` + `u1.C1751c`):
+- Level/brightness: All=4, Unit=7, Group=26
+- Temperature: All=5, Unit=8, Group=27
+- RGB Color: All=6, Unit=9, Group=28
+- Vertical: All=22, Unit=24, Group=29
+- White: All=23, Unit=25, Group=30
+
+Implementation:
+- `casambi-bt/src/CasambiBt/_casambi.py` methods `setLevel`, `setTemperature`, `setColor`, etc.
+
+### Classic Debug Logging
+
+Markers:
+- `[CASAMBI_CLASSIC_CONN_HASH]` first 8 bytes used for signing (debug)
+- `[CASAMBI_CLASSIC_TX]` signed TX metadata (debug)
+- `[CASAMBI_CLASSIC_TX_RAW]` signed TX bytes (debug)
+- `[CASAMBI_CLASSIC_RX_RAW]` RX bytes (debug)
+- `[CASAMBI_CLASSIC_RX_VERIFY]` CMAC verification result (debug)
+- `[CASAMBI_CLASSIC_CMD]` best-effort parsed command records (debug)
+
+To avoid log spam, raw notify hexdumps are opt-in:
+- Set `CASAMBI_BT_LOG_RAW_NOTIFIES=1` to log per-notify hexdumps in `_client.py`.

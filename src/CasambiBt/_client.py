@@ -1,11 +1,12 @@
 import asyncio
 import inspect
 import logging
+import os
 import platform
 import struct
 from binascii import b2a_hex as b2a
 from collections.abc import Callable
-from enum import IntEnum, unique
+from enum import Enum, IntEnum, auto, unique
 from hashlib import sha256
 from typing import Any, Final
 
@@ -23,6 +24,8 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from ._constants import CASA_AUTH_CHAR_UUID, ConnectionState
+from ._constants import CASA_CLASSIC_DATA_CHAR_UUID, CASA_CLASSIC_HASH_CHAR_UUID
+from ._classic_crypto import classic_cmac_prefix
 from ._encryption import Encryptor
 from ._network import Network
 from ._switch_events import SwitchEventStreamDecoder
@@ -31,6 +34,8 @@ from ._switch_events import SwitchEventStreamDecoder
 from .errors import (  # noqa: E402
     BluetoothError,
     ConnectionStateError,
+    ClassicHandshakeError,
+    ClassicKeysMissingError,
     NetworkNotFoundError,
     ProtocolError,
     UnsupportedProtocolVersion,
@@ -42,6 +47,11 @@ class IncommingPacketType(IntEnum):
     UnitState = 6
     SwitchEvent = 7
     NetworkConfig = 9
+
+
+class ProtocolMode(Enum):
+    EVO = auto()
+    CLASSIC = auto()
 
 
 MIN_VERSION: Final[int] = 10
@@ -87,7 +97,27 @@ class CasambiClient:
         self._disconnectedCallback = disonnectedCallback
         self._activityLock = asyncio.Lock()
 
-        self._checkProtocolVersion(network.protocolVersion)
+        # Determined at runtime by inspecting GATT services/characteristics.
+        self._protocolMode: ProtocolMode | None = None
+        self._dataCharUuid: str | None = None
+
+        # Classic protocol state
+        self._classicConnHash8: bytes | None = None
+        self._classicTxSeq: int = 0  # 16-bit sequence number (big endian on the wire)
+        self._classicCmdDiv: int = 0  # 8-bit per-command divider/id (matches u1.C1751c.b0)
+
+        # Avoid log spam in Home Assistant: raw notify hexdumps are opt-in.
+        self._logRawNotifies: bool = os.getenv("CASAMBI_BT_LOG_RAW_NOTIFIES", "").strip() in {
+            "1",
+            "true",
+            "TRUE",
+            "yes",
+            "YES",
+        }
+
+    @property
+    def protocolMode(self) -> ProtocolMode | None:
+        return self._protocolMode
 
     def _checkProtocolVersion(self, version: int) -> None:
         if version < MIN_VERSION:
@@ -176,6 +206,115 @@ class CasambiClient:
 
         self._logger.info(f"Connected to {self.address}")
         self._connectionState = ConnectionState.CONNECTED
+
+        # Detect protocol mode by available characteristics.
+        services = await self._gattClient.get_services()
+
+        def _has_char(uuid: str) -> bool:
+            uuid_l = uuid.lower()
+            for s in services:
+                for c in s.characteristics:
+                    if c.uuid.lower() == uuid_l:
+                        return True
+            return False
+
+        # Classic (non-conformant) uses CA51 (connection hash) + CA52 (data channel).
+        if _has_char(CASA_CLASSIC_HASH_CHAR_UUID) and _has_char(CASA_CLASSIC_DATA_CHAR_UUID):
+            if os.getenv("CASAMBI_BT_DISABLE_CLASSIC", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
+                raise ProtocolError("Classic protocol detected but disabled via CASAMBI_BT_DISABLE_CLASSIC=1")
+
+            if not self._network.hasClassicKeys():
+                raise ClassicKeysMissingError(
+                    "Classic protocol detected but network has no visitorKey/managerKey."
+                )
+
+            self._protocolMode = ProtocolMode.CLASSIC
+            self._dataCharUuid = CASA_CLASSIC_DATA_CHAR_UUID
+
+            # Read connection hash (first 8 bytes are used for CMAC signing).
+            raw_hash = await self._gattClient.read_gatt_char(CASA_CLASSIC_HASH_CHAR_UUID)
+            if raw_hash is None or len(raw_hash) < 8:
+                raise ClassicHandshakeError(
+                    f"Classic connection hash read failed/too short (len={0 if raw_hash is None else len(raw_hash)})."
+                )
+            self._classicConnHash8 = bytes(raw_hash[:8])
+            # Android seeds the command divider with a random byte on startup (u1.C1751c).
+            self._classicCmdDiv = int.from_bytes(os.urandom(1), "big") or 1
+            self._classicTxSeq = 0
+
+            # Start notify on the data channel.
+            notify_kwargs: dict[str, Any] = {}
+            notify_params = inspect.signature(self._gattClient.start_notify).parameters
+            if "bluez" in notify_params:
+                notify_kwargs["bluez"] = {"use_start_notify": True}
+            await self._gattClient.start_notify(
+                CASA_CLASSIC_DATA_CHAR_UUID,
+                self._queueCallback,
+                **notify_kwargs,
+            )
+
+            # Classic has no EVO-style key exchange/auth; we can send immediately.
+            self._connectionState = ConnectionState.AUTHENTICATED
+            self._logger.info("Protocol mode selected: CLASSIC")
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug(
+                    "[CASAMBI_CLASSIC_CONN_HASH] len=%d hash=%s",
+                    len(self._classicConnHash8),
+                    b2a(self._classicConnHash8),
+                )
+            return
+
+        # Conformant devices can expose the Classic signed channel on the EVO-style UUID too.
+        if _has_char(CASA_AUTH_CHAR_UUID):
+            first = await self._gattClient.read_gatt_char(CASA_AUTH_CHAR_UUID)
+            if first and len(first) >= 2 and first[0] == 0x01:
+                # EVO NodeInfo packet starts with 0x01.
+                self._protocolMode = ProtocolMode.EVO
+                self._dataCharUuid = CASA_AUTH_CHAR_UUID
+                self._checkProtocolVersion(self._network.protocolVersion)
+                self._logger.info("Protocol mode selected: EVO")
+                return
+
+            # Otherwise, treat as Classic conformant: read provides connection hash.
+            if os.getenv("CASAMBI_BT_DISABLE_CLASSIC", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
+                raise ProtocolError("Classic protocol detected but disabled via CASAMBI_BT_DISABLE_CLASSIC=1")
+            if not self._network.hasClassicKeys():
+                raise ClassicKeysMissingError(
+                    "Classic protocol detected but network has no visitorKey/managerKey."
+                )
+            if first is None or len(first) < 8:
+                raise ClassicHandshakeError(
+                    f"Classic connection hash read failed/too short (len={0 if first is None else len(first)})."
+                )
+
+            self._protocolMode = ProtocolMode.CLASSIC
+            self._dataCharUuid = CASA_AUTH_CHAR_UUID
+            self._classicConnHash8 = bytes(first[:8])
+            self._classicCmdDiv = int.from_bytes(os.urandom(1), "big") or 1
+            self._classicTxSeq = 0
+
+            notify_kwargs: dict[str, Any] = {}
+            notify_params = inspect.signature(self._gattClient.start_notify).parameters
+            if "bluez" in notify_params:
+                notify_kwargs["bluez"] = {"use_start_notify": True}
+            await self._gattClient.start_notify(
+                CASA_AUTH_CHAR_UUID,
+                self._queueCallback,
+                **notify_kwargs,
+            )
+            self._connectionState = ConnectionState.AUTHENTICATED
+            self._logger.info("Protocol mode selected: CLASSIC")
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug(
+                    "[CASAMBI_CLASSIC_CONN_HASH] len=%d hash=%s",
+                    len(self._classicConnHash8),
+                    b2a(self._classicConnHash8),
+                )
+            return
+
+        raise ProtocolError(
+            "No supported Casambi characteristics found (Classic ca51/ca52 or EVO/Classic conformant auth char)."
+        )
 
     def _on_disconnect(self, client: BleakClient) -> None:
         if self._connectionState != ConnectionState.NONE:
@@ -292,7 +431,13 @@ class CasambiClient:
     def _callbackMulitplexer(
         self, handle: BleakGATTCharacteristic, data: bytes
     ) -> None:
-        self._logger.debug(f"Callback on handle {handle}: {b2a(data)}")
+        if self._logRawNotifies and self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
+                "Callback on handle %s (%s): %s",
+                getattr(handle, "handle", "?"),
+                getattr(handle, "uuid", "?"),
+                b2a(data),
+            )
 
         if self._connectionState == ConnectionState.CONNECTED:
             self._exchNofityCallback(handle, data)
@@ -432,6 +577,12 @@ class CasambiClient:
         return self._nonce[:4] + id + self._nonce[8:]
 
     async def send(self, packet: bytes) -> None:
+        # EVO sends INVOCATION operations (packet type=0x07) inside the encrypted channel.
+        # Classic sends signed command frames on the CA52 channel.
+        if self._protocolMode == ProtocolMode.CLASSIC:
+            await self._sendClassicSigned(packet)
+            return
+
         self._checkState(ConnectionState.AUTHENTICATED)
 
         await self._activityLock.acquire()
@@ -452,9 +603,167 @@ class CasambiClient:
         finally:
             self._activityLock.release()
 
+    def _classic_next_seq(self) -> int:
+        # 16-bit sequence inserted in the header (big endian) and included in CMAC input.
+        self._classicTxSeq = (self._classicTxSeq + 1) & 0xFFFF
+        if self._classicTxSeq == 0:
+            self._classicTxSeq = 1
+        return self._classicTxSeq
+
+    def _classic_next_div(self) -> int:
+        # 8-bit command divider/id. Android uses a random start and increments 1..255.
+        self._classicCmdDiv += 1
+        if self._classicCmdDiv == 0 or self._classicCmdDiv > 255:
+            self._classicCmdDiv = 1
+        return self._classicCmdDiv
+
+    def buildClassicCommand(
+        self,
+        command_ordinal: int,
+        payload: bytes,
+        *,
+        target_id: int | None = None,
+        lifetime: int = 200,
+        div: int | None = None,
+    ) -> bytes:
+        """Build one Classic command record (u1.C1753e export format).
+
+        This is the message that follows the Classic signed header and 16-bit sequence.
+        """
+        if div is None:
+            div = self._classic_next_div()
+        if div < 0 or div > 255:
+            raise ValueError("div must fit in one byte")
+        if lifetime < 0 or lifetime > 255:
+            raise ValueError("lifetime must fit in one byte")
+        if target_id is not None and (target_id < 0 or target_id > 255):
+            raise ValueError("target_id must fit in one byte")
+
+        # Two leading bytes are patched after we know the final length:
+        # - byte0 = (len + 239) mod 256
+        # - byte1 = ordinal | 0x40 (div present) | 0x80 (target present)
+        b = bytearray()
+        b.append(0)
+        b.append(0)
+
+        type_flags = command_ordinal & 0x3F
+
+        # div present
+        b.append(div & 0xFF)
+        type_flags |= 0x40
+
+        if target_id is not None and target_id > 0:
+            b.append(target_id & 0xFF)
+            type_flags |= 0x80
+
+        b.append(lifetime & 0xFF)
+        b.extend(payload)
+
+        msg_len = len(b)
+        b[0] = (msg_len + 239) & 0xFF
+        b[1] = type_flags & 0xFF
+
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
+                "[CASAMBI_CLASSIC_CMD_BUILD] ord=%d target=%s div=%d lifetime=%d len=%d payload=%s",
+                command_ordinal,
+                target_id,
+                div,
+                lifetime,
+                msg_len,
+                b2a(payload),
+            )
+
+        return bytes(b)
+
+    async def _sendClassicSigned(self, command_bytes: bytes, *, use_manager: bool | None = None) -> None:
+        self._checkState(ConnectionState.AUTHENTICATED)
+        if self._protocolMode != ProtocolMode.CLASSIC:
+            raise ProtocolError("Classic send called while not in Classic protocol mode.")
+        if not self._dataCharUuid:
+            raise ProtocolError("Classic data characteristic UUID not set.")
+        if self._classicConnHash8 is None:
+            raise ClassicHandshakeError("Classic connection hash not available.")
+
+        # Decide whether to use visitor or manager key.
+        if use_manager is None:
+            use_manager = os.getenv("CASAMBI_BT_CLASSIC_USE_MANAGER", "").strip() in {
+                "1",
+                "true",
+                "TRUE",
+                "yes",
+                "YES",
+            }
+
+        visitor_key = self._network.classicVisitorKey()
+        manager_key = self._network.classicManagerKey()
+
+        key_name = "visitor"
+        auth_level = 0x02
+        sig_len = 4
+        key = visitor_key
+
+        if use_manager or key is None:
+            if manager_key is None:
+                # If we were forced to use manager but don't have one, fall back to visitor if present.
+                if visitor_key is None:
+                    raise ClassicKeysMissingError(
+                        "Classic network has no visitorKey/managerKey available."
+                    )
+                key = visitor_key
+            else:
+                key_name = "manager"
+                auth_level = 0x03
+                sig_len = 16
+                key = manager_key
+
+        seq = self._classic_next_seq()
+
+        # Header layout (rVar.Z=true / "conformant" classic):
+        #   [0] auth_level (2 visitor / 3 manager)
+        #   [1..sig_len] CMAC prefix placeholder (filled after CMAC computation)
+        #   [1+sig_len .. 1+sig_len+1] 16-bit sequence, big endian (included in CMAC input)
+        #   [..] command bytes
+        pkt = bytearray()
+        pkt.append(auth_level)
+        pkt.extend(b"\x00" * sig_len)
+        pkt.extend(b"\x00\x00")
+        pkt.extend(command_bytes)
+
+        seq_off = 1 + sig_len
+        pkt[seq_off] = (seq >> 8) & 0xFF
+        pkt[seq_off + 1] = seq & 0xFF
+
+        cmac_input = bytes(pkt[seq_off:])  # includes seq + command bytes
+        prefix = classic_cmac_prefix(key, self._classicConnHash8, cmac_input, sig_len)
+        pkt[1 : 1 + sig_len] = prefix
+
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
+                "[CASAMBI_CLASSIC_TX] key=%s auth=0x%02x sig_len=%d seq=0x%04x cmd_len=%d total_len=%d",
+                key_name,
+                auth_level,
+                sig_len,
+                seq,
+                len(command_bytes),
+                len(pkt),
+            )
+            self._logger.debug(
+                "[CASAMBI_CLASSIC_TX_RAW] %s",
+                b2a(bytes(pkt[: min(len(pkt), 64)])) + (b"..." if len(pkt) > 64 else b""),
+            )
+
+        # Classic packets can exceed 20 bytes when using a 16-byte manager signature.
+        # Bleak needs a write-with-response for long writes on most backends.
+        await self._gattClient.write_gatt_char(self._dataCharUuid, bytes(pkt), response=True)
+
     def _establishedNofityCallback(
         self, handle: BleakGATTCharacteristic, data: bytes
     ) -> None:
+        if self._protocolMode == ProtocolMode.CLASSIC:
+            self._classicEstablishedNotifyCallback(handle, data)
+            return
+
         # TODO: Check incoming counter and direction flag
         self._inPacketCount += 1
 
@@ -514,6 +823,153 @@ class CasambiClient:
             pass
         else:
             self._logger.debug("Packet type %d not implemented. Ignoring!", packetType)
+
+    def _classicEstablishedNotifyCallback(
+        self, handle: BleakGATTCharacteristic, data: bytes
+    ) -> None:
+        """Parse Classic notifications from the CA52 channel.
+
+        Classic packets are CMAC-signed (prefix embedded into the header).
+        Ground truth: casambi-android `t1.P.o(...)`.
+        """
+        self._inPacketCount += 1
+
+        raw = bytes(data)
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
+                "[CASAMBI_CLASSIC_RX_RAW] len=%d hex=%s",
+                len(raw),
+                b2a(raw[: min(len(raw), 64)]) + (b"..." if len(raw) > 64 else b""),
+            )
+
+        if self._classicConnHash8 is None:
+            self._logger.debug("[CASAMBI_CLASSIC_RX] Missing connection hash; cannot verify CMAC.")
+            return
+
+        visitor_key = self._network.classicVisitorKey()
+        manager_key = self._network.classicManagerKey()
+
+        verified = False
+        key_name: str | None = None
+        sig_len: int | None = None
+        payload_with_seq: bytes | None = None
+
+        # Try visitor (4-byte prefix) first, then manager (16-byte prefix).
+        # Some frames may be unsigned; in that case verification will fail and we'll fall back.
+        candidates: list[tuple[str, bytes | None, int]] = [
+            ("visitor", visitor_key, 4),
+            ("manager", manager_key, 16),
+        ]
+
+        for name, key, slen in candidates:
+            if key is None:
+                continue
+            header_len = 1 + slen + 2
+            if len(raw) < header_len:
+                continue
+
+            auth_level = raw[0]
+            sig = raw[1 : 1 + slen]
+            cmac_input = raw[1 + slen :]  # seq(2) + payload
+
+            try:
+                expected = classic_cmac_prefix(key, self._classicConnHash8, cmac_input, slen)
+            except Exception:
+                continue
+
+            if expected == sig:
+                verified = True
+                key_name = name
+                sig_len = slen
+                payload_with_seq = cmac_input
+                if self._logger.isEnabledFor(logging.DEBUG):
+                    seq = int.from_bytes(cmac_input[:2], byteorder="big", signed=False)
+                    self._logger.debug(
+                        "[CASAMBI_CLASSIC_RX_VERIFY] ok key=%s auth=0x%02x sig_len=%d seq=0x%04x",
+                        name,
+                        auth_level,
+                        slen,
+                        seq,
+                    )
+                break
+
+        if not verified:
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug("[CASAMBI_CLASSIC_RX_VERIFY] failed (no matching CMAC prefix)")
+            # Best-effort: treat raw bytes as payload.
+            payload = raw
+        else:
+            assert payload_with_seq is not None
+            # Drop the 16-bit sequence from the payload for higher-level parsing.
+            payload = payload_with_seq[2:]
+
+        if not payload:
+            return
+
+        # If the payload starts with a known EVO packet type, reuse existing parsers.
+        packet_type = payload[0]
+        if packet_type in (IncommingPacketType.UnitState, IncommingPacketType.SwitchEvent, IncommingPacketType.NetworkConfig):
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug(
+                    "[CASAMBI_CLASSIC_RX_PAYLOAD] type=%d len=%d hex=%s",
+                    packet_type,
+                    len(payload),
+                    b2a(payload[: min(len(payload), 64)])
+                    + (b"..." if len(payload) > 64 else b""),
+                )
+            if packet_type == IncommingPacketType.UnitState:
+                self._parseUnitStates(payload[1:])
+            elif packet_type == IncommingPacketType.SwitchEvent:
+                self._parseSwitchEvent(payload[1:], None, raw)
+            else:
+                # ignore network config
+                pass
+            return
+
+        # Otherwise, attempt to parse a stream of Classic "command" records:
+        # record[0] = (len + 239) mod 256, so len = (b0 - 239) & 0xFF.
+        pos = 0
+        while pos + 2 <= len(payload):
+            enc_len = payload[pos]
+            rec_len = (enc_len - 239) & 0xFF
+            if rec_len < 2 or pos + rec_len > len(payload):
+                break
+            rec = payload[pos : pos + rec_len]
+            pos += rec_len
+
+            typ = rec[1]
+            ordinal = typ & 0x3F
+            has_div = (typ & 0x40) != 0
+            has_target = (typ & 0x80) != 0
+            p = 2
+            div = rec[p] if has_div and p < len(rec) else None
+            if has_div:
+                p += 1
+            target = rec[p] if has_target and p < len(rec) else None
+            if has_target:
+                p += 1
+            lifetime = rec[p] if p < len(rec) else None
+            if lifetime is not None:
+                p += 1
+            rec_payload = rec[p:] if p <= len(rec) else b""
+
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug(
+                    "[CASAMBI_CLASSIC_CMD] ord=%d div=%s target=%s lifetime=%s payload=%s",
+                    ordinal,
+                    div,
+                    target,
+                    lifetime,
+                    b2a(rec_payload),
+                )
+
+        # Any trailing bytes that don't form a full record are logged for analysis.
+        if self._logger.isEnabledFor(logging.DEBUG) and pos < len(payload):
+            self._logger.debug(
+                "[CASAMBI_CLASSIC_CMD_TRAILING] len=%d hex=%s",
+                len(payload) - pos,
+                b2a(payload[pos:]),
+            )
 
     def _parseUnitStates(self, data: bytes) -> None:
         # Ground truth: casambi-android `v1.C1775b.V(Q2.h)` parses decrypted packet type=6

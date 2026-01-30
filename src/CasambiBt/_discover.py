@@ -5,7 +5,7 @@ from bleak import BleakScanner
 from bleak.backends.client import BLEDevice
 from bleak.exc import BleakDBusError, BleakError
 
-from ._constants import CASA_UUID
+from ._constants import CASA_UUID, CASA_UUID_CLASSIC
 from .errors import BluetoothError
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,7 +39,8 @@ async def discover() -> list[BLEDevice]:
     discovered = []
     for _, (d, advertisement) in devices_and_advertisements.items():
         if 963 in advertisement.manufacturer_data:
-            if CASA_UUID in advertisement.service_uuids:
+            # Evolution networks advertise FE4D; Classic networks advertise CA5A.
+            if CASA_UUID in advertisement.service_uuids or CASA_UUID_CLASSIC in advertisement.service_uuids:
                 _LOGGER.debug(f"Discovered network at {d.address}")
                 discovered.append(d)
 

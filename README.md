@@ -7,6 +7,7 @@ This is a customized fork of the original [casambi-bt](https://github.com/lkempf
 
 - **Switch event support** - Receive button press/release/hold events from Casambi switches (wired + wireless)
 - **Improved relay status handling** - Better support for relay units
+- **Classic protocol (experimental)** - Basic unit control for Classic (legacy) firmware networks
 - **Bug fixes and improvements** - Various fixes based on real-world usage
 
 This library provides a bluetooth interface to Casambi-based lights. It is not associated with Casambi.
@@ -73,6 +74,20 @@ Notes:
 - The library suppresses same-state retransmits at the protocol layer (edge detection), so Home Assistant-style time-window deduplication should generally not be necessary.
 
 For the parsing details and field layout, see `doc/PROTOCOL_PARSING.md`.
+
+### Classic (Legacy Firmware) Support (Experimental)
+
+This library can also connect to **Classic** Casambi networks and send **unit control** commands.
+
+How it works (ground truth: the bundled Android app sources):
+- Classic devices expose a CMAC-signed data channel (`ca51`/`ca52`) or a "Classic conformant" signed channel on the EVO UUID.
+- The cloud network JSON exposes `visitorKey` / `managerKey` (hex strings) instead of an EVO `keyStore`.
+- Commands are signed with AES-CMAC and sent as Classic "command records" (see `doc/PROTOCOL_PARSING.md`).
+
+Environment flags:
+- `CASAMBI_BT_DISABLE_CLASSIC=1` to refuse Classic connections (fail fast)
+- `CASAMBI_BT_CLASSIC_USE_MANAGER=1` to sign with the 16-byte manager signature (default is visitor/4-byte prefix)
+- `CASAMBI_BT_LOG_RAW_NOTIFIES=1` to enable very verbose per-notify hexdumps (mainly for Classic debugging)
 
 ### MacOS
 

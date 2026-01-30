@@ -44,6 +44,10 @@ class Network:
         self._networkName: str | None = None
         self._networkRevision: int | None = None
         self._protocolVersion: int = -1
+        # Classic networks do not have a `keyStore`; instead they expose visitor/manager keys.
+        # Ground truth: casambi-android `D1.Z0` exports `visitorKey`/`managerKey`.
+        self._classicVisitorKey: bytes | None = None
+        self._classicManagerKey: bytes | None = None
         self._rawNetworkData: dict | None = None
 
         self._unitTypes: dict[int, tuple[UnitType | None, datetime]] = {}
@@ -154,6 +158,19 @@ class Network:
     def protocolVersion(self) -> int:
         return self._protocolVersion
 
+    def classicVisitorKey(self) -> bytes | None:
+        return self._classicVisitorKey
+
+    def classicManagerKey(self) -> bytes | None:
+        return self._classicManagerKey
+
+    def classicBestKey(self) -> bytes | None:
+        # Prefer manager key if present, otherwise visitor key.
+        return self._classicManagerKey or self._classicVisitorKey
+
+    def hasClassicKeys(self) -> bool:
+        return bool(self._classicVisitorKey or self._classicManagerKey)
+
     @property
     def rawNetworkData(self) -> dict | None:
         return self._rawNetworkData
@@ -263,8 +280,33 @@ class Network:
             keys = network["network"]["keyStore"]["keys"]
             for k in keys:
                 await self._keystore.addKey(k)
+            # Evolution network: classic keys not used
+            self._classicVisitorKey = None
+            self._classicManagerKey = None
+        else:
+            # Classic network: parse visitorKey / managerKey (hex strings).
+            # Ground truth: casambi-android `D1.Z0` exports these fields.
+            visitor_hex = network["network"].get("visitorKey")
+            manager_hex = network["network"].get("managerKey")
 
-        # TODO: Parse managerKey and visitorKey for classic networks.
+            def _parse_hex_key(v: object) -> bytes | None:
+                if not isinstance(v, str):
+                    return None
+                v = v.strip()
+                if not v:
+                    return None
+                try:
+                    return bytes.fromhex(v)
+                except ValueError:
+                    return None
+
+            self._classicVisitorKey = _parse_hex_key(visitor_hex)
+            self._classicManagerKey = _parse_hex_key(manager_hex)
+            self._logger.info(
+                "Classic keys present: visitor=%s manager=%s",
+                bool(self._classicVisitorKey),
+                bool(self._classicManagerKey),
+            )
 
         # Parse units
         self.units = []

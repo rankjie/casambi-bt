@@ -10,7 +10,7 @@ from bleak.backends.device import BLEDevice
 from httpx import AsyncClient, RequestError
 
 from ._cache import Cache
-from ._client import CasambiClient, ConnectionState, IncommingPacketType
+from ._client import CasambiClient, ConnectionState, IncommingPacketType, ProtocolMode
 from ._network import Network
 from ._operation import OpCode, OperationsContext
 from ._unit import Group, Scene, Unit, UnitControlType, UnitState
@@ -169,8 +169,10 @@ class Casambi:
         self._casaClient = cast(CasambiClient, self._casaClient)
         await self._casaClient.connect()
         try:
-            await self._casaClient.exchangeKey()
-            await self._casaClient.authenticate()
+            # EVO requires key exchange + authenticate; Classic is ready after `connect()`.
+            if self._casaClient.protocolMode == ProtocolMode.EVO:
+                await self._casaClient.exchangeKey()
+                await self._casaClient.authenticate()
         except ProtocolError as e:
             await self._casaClient.disconnect()
             raise e
@@ -201,6 +203,23 @@ class Casambi:
             raise ValueError()
 
         payload = level.to_bytes(1, byteorder="big", signed=False)
+
+        # Classic protocol uses signed command frames (u1.C1753e / u1.EnumC1754f).
+        if self._casaClient is not None and self._casaClient.protocolMode == ProtocolMode.CLASSIC:
+            # EnumC1754f ordinals (ground truth: casambi-android u1.EnumC1754f):
+            # - AllUnitsLevel=4, UnitLevel=7, GroupLevel=26
+            if isinstance(target, Unit):
+                cmd = self._casaClient.buildClassicCommand(7, payload, target_id=target.deviceId)
+            elif isinstance(target, Group):
+                cmd = self._casaClient.buildClassicCommand(26, payload, target_id=target.groudId)
+            elif target is None:
+                cmd = self._casaClient.buildClassicCommand(4, payload)
+            else:
+                raise TypeError(f"Unkown target type {type(target)}")
+
+            await self._casaClient.send(cmd)
+            return
+
         await self._send(target, payload, OpCode.SetLevel)
 
     async def setVertical(self, target: Unit | Group | None, vertical: int) -> None:
@@ -219,6 +238,21 @@ class Casambi:
             raise ValueError()
 
         payload = vertical.to_bytes(1, byteorder="big", signed=False)
+
+        if self._casaClient is not None and self._casaClient.protocolMode == ProtocolMode.CLASSIC:
+            # EnumC1754f ordinals: AllUnitsVertical=22, UnitVertical=24, GroupVertical=29
+            if isinstance(target, Unit):
+                cmd = self._casaClient.buildClassicCommand(24, payload, target_id=target.deviceId)
+            elif isinstance(target, Group):
+                cmd = self._casaClient.buildClassicCommand(29, payload, target_id=target.groudId)
+            elif target is None:
+                cmd = self._casaClient.buildClassicCommand(22, payload)
+            else:
+                raise TypeError(f"Unkown target type {type(target)}")
+
+            await self._casaClient.send(cmd)
+            return
+
         await self._send(target, payload, OpCode.SetVertical)
 
     async def setSlider(self, target: Unit | Group | None, value: int) -> None:
@@ -255,6 +289,21 @@ class Casambi:
             raise ValueError()
 
         payload = level.to_bytes(1, byteorder="big", signed=False)
+
+        if self._casaClient is not None and self._casaClient.protocolMode == ProtocolMode.CLASSIC:
+            # EnumC1754f ordinals: AllUnitsWhite=23, UnitWhite=25, GroupWhite=30
+            if isinstance(target, Unit):
+                cmd = self._casaClient.buildClassicCommand(25, payload, target_id=target.deviceId)
+            elif isinstance(target, Group):
+                cmd = self._casaClient.buildClassicCommand(30, payload, target_id=target.groudId)
+            elif target is None:
+                cmd = self._casaClient.buildClassicCommand(23, payload)
+            else:
+                raise TypeError(f"Unkown target type {type(target)}")
+
+            await self._casaClient.send(cmd)
+            return
+
         await self._send(target, payload, OpCode.SetWhite)
 
     async def setColor(
@@ -272,6 +321,27 @@ class Casambi:
         :raises ValueError: The supplied rgbColor isn't in range
         """
 
+        if self._casaClient is not None and self._casaClient.protocolMode == ProtocolMode.CLASSIC:
+            # Classic uses RGB payload (3 bytes) directly.
+            r, g, b = rgbColor
+            if not (0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255):
+                raise ValueError("rgbColor out of range.")
+            payload = bytes([r & 0xFF, g & 0xFF, b & 0xFF])
+
+            # EnumC1754f ordinals: AllUnitsColor=6, UnitColor=9, GroupColor=28
+            if isinstance(target, Unit):
+                cmd = self._casaClient.buildClassicCommand(9, payload, target_id=target.deviceId)
+            elif isinstance(target, Group):
+                cmd = self._casaClient.buildClassicCommand(28, payload, target_id=target.groudId)
+            elif target is None:
+                cmd = self._casaClient.buildClassicCommand(6, payload)
+            else:
+                raise TypeError(f"Unkown target type {type(target)}")
+
+            await self._casaClient.send(cmd)
+            return
+
+        # Evolution uses HS payload (hue 10-bit + sat 8-bit) for SetColor.
         state = UnitState()
         state.rgb = rgbColor
         hs: tuple[float, float] = state.hs  # type: ignore[assignment]
@@ -300,6 +370,21 @@ class Casambi:
 
         temperature = int(temperature / 50)
         payload = temperature.to_bytes(1, byteorder="big", signed=False)
+
+        if self._casaClient is not None and self._casaClient.protocolMode == ProtocolMode.CLASSIC:
+            # EnumC1754f ordinals: AllUnitsTemperature=5, UnitTemperature=8, GroupTemperature=27
+            if isinstance(target, Unit):
+                cmd = self._casaClient.buildClassicCommand(8, payload, target_id=target.deviceId)
+            elif isinstance(target, Group):
+                cmd = self._casaClient.buildClassicCommand(27, payload, target_id=target.groudId)
+            elif target is None:
+                cmd = self._casaClient.buildClassicCommand(5, payload)
+            else:
+                raise TypeError(f"Unkown target type {type(target)}")
+
+            await self._casaClient.send(cmd)
+            return
+
         await self._send(target, payload, OpCode.SetTemperature)
 
     async def setColorXY(
@@ -316,6 +401,10 @@ class Casambi:
         :return: Nothing is returned by this function. To get the new state register a change handler.
         :raises ValueError: The supplied XYColor isn't in range or not supported by the supplied unit.
         """
+
+        if self._casaClient is not None and self._casaClient.protocolMode == ProtocolMode.CLASSIC:
+            # Classic command set (u1.EnumC1754f) only exposes RGB color control.
+            raise ValueError("XY color control is not supported on Classic networks.")
 
         if xyColor[0] < 0.0 or xyColor[0] > 1.0 or xyColor[1] < 0.0 or xyColor[1] > 1.0:
             raise ValueError("Color out of range.")
@@ -345,6 +434,22 @@ class Casambi:
         :return: Nothing is returned by this function. To get the new state register a change handler.
         """
 
+        if self._casaClient is not None and self._casaClient.protocolMode == ProtocolMode.CLASSIC:
+            # Classic uses a longer payload for "restore last level" (ground truth: casambi-android u1.C1751c.o()).
+            payload = bytes([0xFF, 0x01, 0x00, 0x00, 0x01])
+            # EnumC1754f ordinals: AllUnitsLevel=4, UnitLevel=7, GroupLevel=26
+            if isinstance(target, Unit):
+                cmd = self._casaClient.buildClassicCommand(7, payload, target_id=target.deviceId)
+            elif isinstance(target, Group):
+                cmd = self._casaClient.buildClassicCommand(26, payload, target_id=target.groudId)
+            elif target is None:
+                cmd = self._casaClient.buildClassicCommand(4, payload)
+            else:
+                raise TypeError(f"Unkown target type {type(target)}")
+
+            await self._casaClient.send(cmd)
+            return
+
         # Use -1 to indicate special packet format
         # Use RestoreLastLevel flag (1) and UseFullTimeFlag (4).
         # Not sure what UseFullTime does but this is what the app uses.
@@ -367,6 +472,11 @@ class Casambi:
                 ConnectionState.AUTHENTICATED,
                 ConnectionState.NONE,
             )
+        if self._casaClient.protocolMode == ProtocolMode.CLASSIC:
+            # Classic uses a completely different command encoding (u1.C1753e/u1.EnumC1754f).
+            # Public APIs that support Classic handle it explicitly; anything reaching here would
+            # send an EVO INVOCATION packet which is not valid on Classic.
+            raise ProtocolError(f"Operation {opcode.name} is not supported on Classic networks via INVOCATION.")
 
         targetCode = 0
         if isinstance(target, Unit):

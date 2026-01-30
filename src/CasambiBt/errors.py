@@ -69,3 +69,15 @@ class UnsupportedProtocolVersion(CasambiBtError):
     """Exception that is raised when the network has an unsupported version."""
 
     pass
+
+
+class ClassicKeysMissingError(ProtocolError):
+    """Classic network is missing visitorKey/managerKey required for signing packets."""
+
+    pass
+
+
+class ClassicHandshakeError(ProtocolError):
+    """Classic network handshake/initialization failed (e.g. connection hash unavailable)."""
+
+    pass
