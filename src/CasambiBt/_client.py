@@ -100,6 +100,8 @@ class CasambiClient:
         # Determined at runtime by inspecting GATT services/characteristics.
         self._protocolMode: ProtocolMode | None = None
         self._dataCharUuid: str | None = None
+        # EVO only: protocolVersion from the device-provided NodeInfo (byte1).
+        self._deviceProtocolVersion: int | None = None
 
         # Classic protocol state
         self._classicConnHash8: bytes | None = None
@@ -119,14 +121,29 @@ class CasambiClient:
     def protocolMode(self) -> ProtocolMode | None:
         return self._protocolMode
 
-    def _checkProtocolVersion(self, version: int) -> None:
+    def _checkProtocolVersion(self, version: int, *, source: str = "unknown") -> None:
+        strict = os.getenv("CASAMBI_BT_STRICT_PROTOCOL_VERSION", "").strip() in {
+            "1",
+            "true",
+            "TRUE",
+            "yes",
+            "YES",
+        }
         if version < MIN_VERSION:
-            raise UnsupportedProtocolVersion(
-                f"Legacy version aren't supported currently. Your network version is {version}. Minimum version is {MIN_VERSION}."
+            # Legacy protocol versions are intentionally allowed. We keep this check as a warning
+            # because packet layouts/handshakes may differ and we want actionable tester logs.
+            msg = (
+                f"Legacy protocol version detected ({source}={version}). "
+                f"Versions < {MIN_VERSION} are not fully verified; attempting to continue."
             )
+            if strict:
+                raise UnsupportedProtocolVersion(msg)
+            self._logger.warning(msg)
+            return
         if version > MAX_VERSION:
             self._logger.warning(
-                "Version too new. Your network version is %i. Highest supported version is %i. Continue at your own risk.",
+                "Version too new (%s=%i). Highest supported version is %i. Continue at your own risk.",
+                source,
                 version,
                 MAX_VERSION,
             )
@@ -217,11 +234,45 @@ class CasambiClient:
         #  2) EVO: auth char read starts with 0x01 (NodeInfo)
         #  3) Classic "conformant": auth char read returns connection hash (first 8 bytes used)
 
+        cloud_protocol = getattr(self._network, "protocolVersion", None)
+        ca51_prefix: bytes | None = None
+        ca51_err: str | None = None
+        auth_prefix: bytes | None = None
+        auth_err: str | None = None
+        device_nodeinfo_protocol: int | None = None
+
+        def _log_probe_summary(mode: str) -> None:
+            # One stable, high-signal line for testers.
+            self._logger.info(
+                "[CASAMBI_PROTOCOL_PROBE] address=%s mode=%s cloud_protocol=%s device_nodeinfo_protocol=%s "
+                "data_uuid=%s classic_hash8_present=%s auth_read_prefix=%s ca51_read_prefix=%s ca51_read_error=%s auth_read_error=%s",
+                self.address,
+                mode,
+                cloud_protocol,
+                device_nodeinfo_protocol,
+                self._dataCharUuid,
+                bool(classic_hash and len(classic_hash) >= 8),
+                auth_prefix,
+                ca51_prefix,
+                ca51_err,
+                auth_err,
+            )
+
         classic_hash: bytes | None = None
         try:
             classic_hash = await self._gattClient.read_gatt_char(CASA_CLASSIC_HASH_CHAR_UUID)
-        except Exception:
+            ca51_prefix = b2a(classic_hash[:10]) if classic_hash else None
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug(
+                    "[CASAMBI_GATT_PROBE] read ca51 ok len=%d prefix=%s",
+                    0 if classic_hash is None else len(classic_hash),
+                    ca51_prefix,
+                )
+        except Exception as e:
             classic_hash = None
+            ca51_err = type(e).__name__
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug("[CASAMBI_GATT_PROBE] read ca51 fail err=%s", ca51_err)
 
         if classic_hash and len(classic_hash) >= 8:
             if os.getenv("CASAMBI_BT_DISABLE_CLASSIC", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
@@ -260,7 +311,12 @@ class CasambiClient:
             except Exception as e:
                 # Some firmwares may expose Classic signing on the EVO UUID instead.
                 # Fall through to auth-char probing if CA52 isn't available.
-                self._logger.debug("Classic CA52 notify failed; trying auth UUID probing.", exc_info=True)
+                if self._logger.isEnabledFor(logging.DEBUG):
+                    self._logger.debug(
+                        "[CASAMBI_GATT_PROBE] start_notify ca52 fail err=%s; trying auth UUID probing.",
+                        type(e).__name__,
+                        exc_info=True,
+                    )
                 self._protocolMode = None
                 self._dataCharUuid = None
                 self._classicConnHash8 = None
@@ -270,26 +326,78 @@ class CasambiClient:
                 self._connectionState = ConnectionState.AUTHENTICATED
                 self._logger.info("Protocol mode selected: CLASSIC")
                 if self._logger.isEnabledFor(logging.DEBUG):
+                    self._logger.debug("[CASAMBI_GATT_PROBE] start_notify ca52 ok")
                     self._logger.debug(
                         "[CASAMBI_CLASSIC_CONN_HASH] len=%d hash=%s",
                         len(self._classicConnHash8),
                         b2a(self._classicConnHash8),
                     )
+                _log_probe_summary("CLASSIC")
                 return
 
         # Conformant devices can expose the Classic signed channel on the EVO-style UUID too.
         first: bytes | None = None
         try:
             first = await self._gattClient.read_gatt_char(CASA_AUTH_CHAR_UUID)
-        except Exception:
+            auth_prefix = b2a(first[:10]) if first else None
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug(
+                    "[CASAMBI_GATT_PROBE] read auth ok len=%d first_byte=%s prefix=%s",
+                    0 if first is None else len(first),
+                    None if not first else f"0x{first[0]:02x}",
+                    auth_prefix,
+                )
+        except Exception as e:
             first = None
+            auth_err = type(e).__name__
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug("[CASAMBI_GATT_PROBE] read auth fail err=%s", auth_err)
 
         if first and len(first) >= 2 and first[0] == 0x01:
             # EVO NodeInfo packet starts with 0x01.
+            device_nodeinfo_protocol = first[1]
+            self._deviceProtocolVersion = device_nodeinfo_protocol
+            mtu = unit = flags = None
+            nonce_prefix = None
+            if len(first) >= 23:
+                try:
+                    mtu, unit, flags, nonce = struct.unpack_from(">BHH16s", first, 2)
+                    nonce_prefix = b2a(nonce[:8])
+                except Exception:
+                    if self._logger.isEnabledFor(logging.DEBUG):
+                        self._logger.debug("Failed to parse NodeInfo fields for logging.", exc_info=True)
+
+            self._logger.info(
+                "[CASAMBI_EVO_NODEINFO] cloud_protocol=%s device_protocol=%s mtu=%s unit=%s flags=%s nonce_prefix=%s len=%d prefix=%s",
+                cloud_protocol,
+                device_nodeinfo_protocol,
+                mtu,
+                unit,
+                None if flags is None else f"0x{flags:04x}",
+                nonce_prefix,
+                len(first),
+                b2a(first[: min(len(first), 32)]),
+            )
+            if cloud_protocol is not None and device_nodeinfo_protocol != cloud_protocol:
+                self._logger.warning(
+                    "[CASAMBI_EVO_NODEINFO_MISMATCH] cloud_protocol=%s device_protocol=%s",
+                    cloud_protocol,
+                    device_nodeinfo_protocol,
+                )
+            if len(first) < 23:
+                self._logger.warning(
+                    "[CASAMBI_EVO_NODEINFO_SHORT] len=%d cloud_protocol=%s device_protocol=%s prefix=%s",
+                    len(first),
+                    cloud_protocol,
+                    device_nodeinfo_protocol,
+                    b2a(first[: min(len(first), 32)]),
+                )
+
             self._protocolMode = ProtocolMode.EVO
             self._dataCharUuid = CASA_AUTH_CHAR_UUID
-            self._checkProtocolVersion(self._network.protocolVersion)
+            self._checkProtocolVersion(device_nodeinfo_protocol, source="device_nodeinfo")
             self._logger.info("Protocol mode selected: EVO")
+            _log_probe_summary("EVO")
             return
 
         if first is not None:
@@ -323,11 +431,13 @@ class CasambiClient:
             self._connectionState = ConnectionState.AUTHENTICATED
             self._logger.info("Protocol mode selected: CLASSIC")
             if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug("[CASAMBI_GATT_PROBE] start_notify auth ok (classic conformant)")
                 self._logger.debug(
                     "[CASAMBI_CLASSIC_CONN_HASH] len=%d hash=%s",
                     len(self._classicConnHash8),
                     b2a(self._classicConnHash8),
                 )
+            _log_probe_summary("CLASSIC")
             return
 
         raise ProtocolError(
@@ -351,15 +461,54 @@ class CasambiClient:
         try:
             # Initiate communication with device
             firstResp = await self._gattClient.read_gatt_char(CASA_AUTH_CHAR_UUID)
-            self._logger.debug(f"Got {b2a(firstResp)}")
-
-            # Check type and protocol version
-            if not (
-                firstResp[0] == 0x1 and firstResp[1] == self._network.protocolVersion
-            ):
-                self._logger.error(
-                    "Unexpected answer from device! Wrong device or protocol version? Trying to continue."
+            if self._logger.isEnabledFor(logging.DEBUG):
+                self._logger.debug(
+                    "[CASAMBI_EVO_NODEINFO_RAW] len=%d prefix=%s",
+                    len(firstResp),
+                    b2a(firstResp[: min(len(firstResp), 32)]),
                 )
+
+            cloud_protocol = getattr(self._network, "protocolVersion", None)
+            expected_protocol = self._deviceProtocolVersion or cloud_protocol
+
+            # EVO key exchange expects the NodeInfo packet (0x01 ...).
+            if len(firstResp) < 2 or firstResp[0] != 0x01:
+                self._logger.error(
+                    "[CASAMBI_EVO_NODEINFO_UNEXPECTED] expected_prefix=01 len=%d prefix=%s",
+                    len(firstResp),
+                    b2a(firstResp[: min(len(firstResp), 32)]),
+                )
+                raise ProtocolError("Unexpected NodeInfo response while starting key exchange.")
+
+            device_protocol = firstResp[1]
+            self._deviceProtocolVersion = device_protocol
+            self._checkProtocolVersion(device_protocol, source="device_nodeinfo")
+
+            if expected_protocol is not None and device_protocol != expected_protocol:
+                self._logger.warning(
+                    "[CASAMBI_EVO_NODEINFO_MISMATCH] expected_protocol=%s cloud_protocol=%s device_protocol=%s",
+                    expected_protocol,
+                    cloud_protocol,
+                    device_protocol,
+                )
+            elif cloud_protocol is not None and device_protocol != cloud_protocol:
+                # Keep this separate to catch cloud/device mismatches even if we didn't have an expected protocol set.
+                self._logger.warning(
+                    "[CASAMBI_EVO_NODEINFO_MISMATCH] expected_protocol=%s cloud_protocol=%s device_protocol=%s",
+                    expected_protocol,
+                    cloud_protocol,
+                    device_protocol,
+                )
+
+            if len(firstResp) < 23:
+                self._logger.error(
+                    "[CASAMBI_EVO_NODEINFO_SHORT] len=%d cloud_protocol=%s device_protocol=%s prefix=%s",
+                    len(firstResp),
+                    cloud_protocol,
+                    device_protocol,
+                    b2a(firstResp[: min(len(firstResp), 32)]),
+                )
+                raise ProtocolError("NodeInfo response too short while starting key exchange.")
 
             # Parse device info
             self._mtu, self._unit, self._flags, self._nonce = struct.unpack_from(
