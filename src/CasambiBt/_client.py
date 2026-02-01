@@ -142,6 +142,13 @@ class CasambiClient:
         self._classicRxVerified = 0
         self._classicRxUnverifiable = 0
         self._classicRxParseFail = 0
+        self._classicRxType6 = 0
+        self._classicRxType7 = 0
+        self._classicRxType9 = 0
+        self._classicRxCmdStream = 0
+        self._classicRxUnknown = 0
+        # Per-kind sample counters to ensure we emit at least a few examples for reverse engineering.
+        self._classicRxKindSamples: dict[str, int] = {}
         self._classicRxLastStatsTs = time.monotonic()
 
     @property
@@ -259,17 +266,20 @@ class CasambiClient:
         auth_err: str | None = None
         device_nodeinfo_protocol: int | None = None
 
-        def _log_probe_summary(mode: str) -> None:
+        def _log_probe_summary(mode: str, *, classic_variant: str | None = None) -> None:
             # One stable, high-signal line for testers.
             self._logger.warning(
-                "[CASAMBI_PROTOCOL_PROBE] address=%s mode=%s cloud_protocol=%s nodeinfo_b1=%s "
-                "data_uuid=%s classic_hash8_present=%s auth_read_prefix=%s ca51_read_prefix=%s ca51_read_error=%s auth_read_error=%s",
+                "[CASAMBI_PROTOCOL_PROBE] address=%s mode=%s cloud_protocol=%s nodeinfo_b1=%s data_uuid=%s "
+                "classic_variant=%s ca51_hash8_present=%s conn_hash8_ready=%s "
+                "auth_read_prefix=%s ca51_read_prefix=%s ca51_read_error=%s auth_read_error=%s",
                 self.address,
                 mode,
                 cloud_protocol,
                 device_nodeinfo_protocol,
                 self._dataCharUuid,
+                classic_variant,
                 bool(classic_hash and len(classic_hash) >= 8),
+                self._classicConnHash8 is not None,
                 auth_prefix,
                 ca51_prefix,
                 ca51_err,
@@ -343,7 +353,21 @@ class CasambiClient:
                         len(self._classicConnHash8),
                         b2a(self._classicConnHash8),
                     )
-                _log_probe_summary("CLASSIC")
+                self._logger.warning(
+                    "[CASAMBI_CLASSIC_SELECTED] address=%s variant=ca52_legacy data_uuid=%s start_notify_uuid=%s header_mode=%s conn_hash8_prefix=%s",
+                    self.address,
+                    self._dataCharUuid,
+                    CASA_CLASSIC_DATA_CHAR_UUID,
+                    self._classicHeaderMode,
+                    b2a(self._classicConnHash8),
+                )
+                self._logger.warning(
+                    "[CASAMBI_CLASSIC_KEYS] visitor=%s manager=%s cloud_session_is_manager=%s",
+                    self._network.classicVisitorKey() is not None,
+                    self._network.classicManagerKey() is not None,
+                    getattr(self._network, "isManager", lambda: False)(),
+                )
+                _log_probe_summary("CLASSIC", classic_variant="ca52_legacy")
                 return
 
         # Conformant devices can expose the Classic signed channel on the EVO-style UUID too.
@@ -437,7 +461,21 @@ class CasambiClient:
                     len(self._classicConnHash8),
                     b2a(self._classicConnHash8),
                 )
-            _log_probe_summary("CLASSIC")
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_SELECTED] address=%s variant=auth_uuid_conformant data_uuid=%s start_notify_uuid=%s header_mode=%s conn_hash8_prefix=%s",
+                self.address,
+                self._dataCharUuid,
+                CASA_AUTH_CHAR_UUID,
+                self._classicHeaderMode,
+                b2a(self._classicConnHash8),
+            )
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_KEYS] visitor=%s manager=%s cloud_session_is_manager=%s",
+                self._network.classicVisitorKey() is not None,
+                self._network.classicManagerKey() is not None,
+                getattr(self._network, "isManager", lambda: False)(),
+            )
+            _log_probe_summary("CLASSIC", classic_variant="auth_uuid_conformant")
             return
 
         _log_probe_summary("UNKNOWN")
@@ -832,6 +870,34 @@ class CasambiClient:
         visitor_key = self._network.classicVisitorKey()
         manager_key = self._network.classicManagerKey()
 
+        # Parse the command record for logs (u1.C1753e export format).
+        cmd_ordinal: int | None = None
+        cmd_div: int | None = None
+        cmd_target: int | None = None
+        cmd_lifetime: int | None = None
+        cmd_payload_len: int | None = None
+        try:
+            if len(command_bytes) >= 2:
+                typ = command_bytes[1]
+                cmd_ordinal = typ & 0x3F
+                has_div = (typ & 0x40) != 0
+                has_target = (typ & 0x80) != 0
+                p = 2
+                if has_div and p < len(command_bytes):
+                    cmd_div = command_bytes[p]
+                    p += 1
+                if has_target and p < len(command_bytes):
+                    cmd_target = command_bytes[p]
+                    p += 1
+                if p < len(command_bytes):
+                    cmd_lifetime = command_bytes[p]
+                    p += 1
+                if p <= len(command_bytes):
+                    cmd_payload_len = len(command_bytes) - p
+        except Exception:
+            # If parsing fails, keep fields as None.
+            pass
+
         # Key selection mirrors Android's intent:
         # - Use manager key if our cloud session is manager and a managerKey exists.
         # - Else use visitor key if present.
@@ -895,17 +961,34 @@ class CasambiClient:
         else:
             raise ProtocolError(f"Unknown Classic header mode: {header_mode}")
 
+        signed = key is not None
+        if not signed and self._logLimiter.allow("classic_tx_unsigned", burst=10, window_s=300.0):
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_TX_UNSIGNED] reason=keys_missing visitor=%s manager=%s",
+                visitor_key is not None,
+                manager_key is not None,
+            )
+
         # WARNING-level TX logs are intentional: they are needed for Classic reverse engineering.
         # Keep payload logging minimal (prefix only).
         if self._logLimiter.allow("classic_tx", burst=50, window_s=60.0):
+            auth_str = f"0x{auth_level:02x}" if header_mode == "conformant" else None
             self._logger.warning(
-                "[CASAMBI_CLASSIC_TX] header=%s key=%s auth=0x%02x sig_len=%d seq=%s cmd_len=%d total_len=%d prefix=%s",
+                "[CASAMBI_CLASSIC_TX] header=%s key=%s signed=%s auth=%s sig_len=%d seq=%s "
+                "cmd_len=%d cmd_ord=%s target=%s div=%s lifetime=%s payload_len=%s "
+                "total_len=%d prefix=%s",
                 header_mode,
                 key_name,
-                auth_level,
+                signed,
+                auth_str,
                 sig_len,
                 None if seq is None else f"0x{seq:04x}",
                 len(command_bytes),
+                cmd_ordinal,
+                cmd_target,
+                cmd_div,
+                cmd_lifetime,
+                cmd_payload_len,
                 len(pkt),
                 b2a(bytes(pkt[: min(len(pkt), 24)])),
             )
@@ -1213,17 +1296,47 @@ class CasambiClient:
         ):
             self._classicRxLastStatsTs = now
             self._logger.warning(
-                "[CASAMBI_CLASSIC_RX_STATS] frames=%d verified=%d unverifiable=%d parse_fail=%d header=%s",
+                "[CASAMBI_CLASSIC_RX_STATS] frames=%d verified=%d unverifiable=%d parse_fail=%d header=%s "
+                "type6=%d type7=%d type9=%d cmdstream=%d unknown=%d",
                 self._classicRxFrames,
                 self._classicRxVerified,
                 self._classicRxUnverifiable,
                 self._classicRxParseFail,
                 self._classicHeaderMode,
+                self._classicRxType6,
+                self._classicRxType7,
+                self._classicRxType9,
+                self._classicRxCmdStream,
+                self._classicRxUnknown,
             )
 
         # If the payload starts with a known EVO packet type, reuse existing parsers.
         packet_type = payload[0]
         if packet_type in (IncommingPacketType.UnitState, IncommingPacketType.SwitchEvent, IncommingPacketType.NetworkConfig):
+            kind = f"type{int(packet_type)}"
+            if packet_type == IncommingPacketType.UnitState:
+                self._classicRxType6 += 1
+                kind = "type6_unitstate"
+            elif packet_type == IncommingPacketType.SwitchEvent:
+                self._classicRxType7 += 1
+                kind = "type7_switch"
+            else:
+                self._classicRxType9 += 1
+                kind = "type9_netconf"
+
+            # Emit a few per-kind examples for reverse engineering.
+            if self._classicRxKindSamples.get(kind, 0) < 3:
+                self._classicRxKindSamples[kind] = self._classicRxKindSamples.get(kind, 0) + 1
+                self._logger.warning(
+                    "[CASAMBI_CLASSIC_RX_KIND] kind=%s header=%s verified=%s sig_len=%d seq=%s payload_prefix=%s",
+                    kind,
+                    best["mode"],
+                    verified,
+                    best["sig_len"],
+                    None if best["seq"] is None else f"0x{best['seq']:04x}",
+                    b2a(payload[: min(len(payload), 32)]),
+                )
+
             if self._logger.isEnabledFor(logging.DEBUG):
                 self._logger.debug(
                     "[CASAMBI_CLASSIC_RX_PAYLOAD] type=%d len=%d hex=%s",
@@ -1244,6 +1357,7 @@ class CasambiClient:
         # Otherwise, attempt to parse a stream of Classic "command" records:
         # record[0] = (len + 239) mod 256, so len = (b0 - 239) & 0xFF.
         pos = 0
+        parsed_any = False
         while pos + 2 <= len(payload):
             enc_len = payload[pos]
             rec_len = (enc_len - 239) & 0xFF
@@ -1251,6 +1365,7 @@ class CasambiClient:
                 break
             rec = payload[pos : pos + rec_len]
             pos += rec_len
+            parsed_any = True
 
             typ = rec[1]
             ordinal = typ & 0x3F
@@ -1277,6 +1392,25 @@ class CasambiClient:
                     lifetime,
                     b2a(rec_payload),
                 )
+
+        if parsed_any:
+            self._classicRxCmdStream += 1
+            kind = "cmdstream"
+        else:
+            self._classicRxUnknown += 1
+            kind = "unknown"
+
+        if self._classicRxKindSamples.get(kind, 0) < 3:
+            self._classicRxKindSamples[kind] = self._classicRxKindSamples.get(kind, 0) + 1
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_RX_KIND] kind=%s header=%s verified=%s sig_len=%d seq=%s payload_prefix=%s",
+                kind,
+                best["mode"],
+                verified,
+                best["sig_len"],
+                None if best["seq"] is None else f"0x{best['seq']:04x}",
+                b2a(payload[: min(len(payload), 32)]),
+            )
 
         # Any trailing bytes that don't form a full record are logged for analysis.
         if self._logger.isEnabledFor(logging.DEBUG) and pos < len(payload):
