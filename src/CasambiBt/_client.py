@@ -25,7 +25,13 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from ._constants import CASA_AUTH_CHAR_UUID, ConnectionState
-from ._constants import CASA_CLASSIC_DATA_CHAR_UUID, CASA_CLASSIC_HASH_CHAR_UUID
+from ._constants import (
+    CASA_CLASSIC_CA53_CHAR_UUID,
+    CASA_CLASSIC_CONFORMANT_CA51_CHAR_UUID,
+    CASA_CLASSIC_CONFORMANT_CA53_CHAR_UUID,
+    CASA_CLASSIC_DATA_CHAR_UUID,
+    CASA_CLASSIC_HASH_CHAR_UUID,
+)
 from ._classic_crypto import classic_cmac_prefix
 from ._encryption import Encryptor
 from ._network import Network
@@ -135,6 +141,12 @@ class CasambiClient:
         # - "legacy":     [sig][payload]
         # Ground truth: casambi-android `t1.P.n(...)` and `t1.P.o(...)`.
         self._classicHeaderMode: str | None = None  # "conformant" | "legacy"
+        # Classic transport diagnostics / channel selection.
+        self._classicTxCharUuid: str | None = None
+        self._classicNotifyCharUuids: set[str] = set()
+        self._classicHashSource: str | None = None  # "ca51" | "ca52_0001" | None
+        self._classicFirstRxTs: float | None = None
+        self._classicNoRxTask: asyncio.Task[None] | None = None
 
         # Rate limit WARNING logs (especially Classic RX) to keep HA usable.
         self._logLimiter = _LogBurstLimiter()
@@ -185,6 +197,23 @@ class CasambiClient:
         # Reset packet counters
         self._outPacketCount = 2
         self._inPacketCount = 1
+
+        # Reset protocol-specific state (important for reconnects).
+        self._protocolMode = None
+        self._dataCharUuid = None
+        self._deviceProtocolVersion = None
+
+        self._classicConnHash8 = None
+        self._classicTxSeq = 0
+        self._classicCmdDiv = 0
+        self._classicHeaderMode = None
+        self._classicTxCharUuid = None
+        self._classicNotifyCharUuids.clear()
+        self._classicHashSource = None
+        self._classicFirstRxTs = None
+        if self._classicNoRxTask is not None:
+            self._classicNoRxTask.cancel()
+            self._classicNoRxTask = None
 
         # Reset callback queue
         self._callbackQueue = asyncio.Queue()
@@ -262,28 +291,43 @@ class CasambiClient:
         cloud_protocol = getattr(self._network, "protocolVersion", None)
         ca51_prefix: bytes | None = None
         ca51_err: str | None = None
+        ca52_notify_err: str | None = None
+        ca53_notify_err: str | None = None
         auth_prefix: bytes | None = None
         auth_err: str | None = None
+        c0002_prefix: bytes | None = None
+        c0002_err: str | None = None
+        c0003_notify_err: str | None = None
         device_nodeinfo_protocol: int | None = None
 
         def _log_probe_summary(mode: str, *, classic_variant: str | None = None) -> None:
             # One stable, high-signal line for testers.
             self._logger.warning(
                 "[CASAMBI_PROTOCOL_PROBE] address=%s mode=%s cloud_protocol=%s nodeinfo_b1=%s data_uuid=%s "
-                "classic_variant=%s ca51_hash8_present=%s conn_hash8_ready=%s "
-                "auth_read_prefix=%s ca51_read_prefix=%s ca51_read_error=%s auth_read_error=%s",
+                "classic_variant=%s hash_source=%s classic_tx_uuid=%s classic_notify_uuids=%s "
+                "ca51_hash8_present=%s conn_hash8_ready=%s "
+                "auth_read_prefix=%s ca51_read_prefix=%s ca51_read_error=%s auth_read_error=%s "
+                "ca52_notify_error=%s ca53_notify_error=%s c0002_read_prefix=%s c0002_read_error=%s c0003_notify_error=%s",
                 self.address,
                 mode,
                 cloud_protocol,
                 device_nodeinfo_protocol,
                 self._dataCharUuid,
                 classic_variant,
+                self._classicHashSource,
+                self._classicTxCharUuid,
+                sorted(self._classicNotifyCharUuids) if self._classicNotifyCharUuids else None,
                 bool(classic_hash and len(classic_hash) >= 8),
                 self._classicConnHash8 is not None,
                 auth_prefix,
                 ca51_prefix,
                 ca51_err,
                 auth_err,
+                ca52_notify_err,
+                ca53_notify_err,
+                c0002_prefix,
+                c0002_err,
+                c0003_notify_err,
             )
 
         classic_hash: bytes | None = None
@@ -305,7 +349,9 @@ class CasambiClient:
         if classic_hash and len(classic_hash) >= 8:
             self._protocolMode = ProtocolMode.CLASSIC
             self._dataCharUuid = CASA_CLASSIC_DATA_CHAR_UUID
+            self._classicTxCharUuid = CASA_CLASSIC_DATA_CHAR_UUID
             self._classicHeaderMode = "legacy"
+            self._classicHashSource = "ca51"
 
             # Read connection hash (first 8 bytes are used for CMAC signing).
             raw_hash = classic_hash
@@ -330,6 +376,7 @@ class CasambiClient:
                     **notify_kwargs,
                 )
             except Exception as e:
+                ca52_notify_err = type(e).__name__
                 # Some firmwares may expose Classic signing on the EVO UUID instead.
                 # Fall through to auth-char probing if CA52 isn't available.
                 if self._logger.isEnabledFor(logging.DEBUG):
@@ -341,8 +388,25 @@ class CasambiClient:
                 self._protocolMode = None
                 self._dataCharUuid = None
                 self._classicConnHash8 = None
+                self._classicTxCharUuid = None
+                self._classicNotifyCharUuids.clear()
+                self._classicHeaderMode = None
+                self._classicHashSource = None
                 # continue detection below
             else:
+                self._classicNotifyCharUuids.add(CASA_CLASSIC_DATA_CHAR_UUID.lower())
+                # Some Classic firmwares also expose state/config notifications on CA53.
+                try:
+                    await self._gattClient.start_notify(
+                        CASA_CLASSIC_CA53_CHAR_UUID,
+                        self._queueCallback,
+                        **notify_kwargs,
+                    )
+                except Exception as e:
+                    ca53_notify_err = type(e).__name__
+                else:
+                    self._classicNotifyCharUuids.add(CASA_CLASSIC_CA53_CHAR_UUID.lower())
+
                 # Classic has no EVO-style key exchange/auth; we can send immediately.
                 self._connectionState = ConnectionState.AUTHENTICATED
                 self._logger.info("Protocol mode selected: CLASSIC")
@@ -354,10 +418,11 @@ class CasambiClient:
                         b2a(self._classicConnHash8),
                     )
                 self._logger.warning(
-                    "[CASAMBI_CLASSIC_SELECTED] address=%s variant=ca52_legacy data_uuid=%s start_notify_uuid=%s header_mode=%s conn_hash8_prefix=%s",
+                    "[CASAMBI_CLASSIC_SELECTED] address=%s variant=ca52_legacy data_uuid=%s tx_uuid=%s notify_uuids=%s header_mode=%s conn_hash8_prefix=%s",
                     self.address,
                     self._dataCharUuid,
-                    CASA_CLASSIC_DATA_CHAR_UUID,
+                    self._classicTxCharUuid,
+                    sorted(self._classicNotifyCharUuids) if self._classicNotifyCharUuids else None,
                     self._classicHeaderMode,
                     b2a(self._classicConnHash8),
                 )
@@ -368,6 +433,8 @@ class CasambiClient:
                     getattr(self._network, "isManager", lambda: False)(),
                 )
                 _log_probe_summary("CLASSIC", classic_variant="ca52_legacy")
+                # Emit a warning if we never see Classic RX frames; this is a common failure mode.
+                self._classicNoRxTask = asyncio.create_task(self._classic_no_rx_watchdog(30.0))
                 return
 
         # Conformant devices can expose the Classic signed channel on the EVO-style UUID too.
@@ -438,34 +505,79 @@ class CasambiClient:
 
             self._protocolMode = ProtocolMode.CLASSIC
             self._dataCharUuid = CASA_AUTH_CHAR_UUID
+            self._classicTxCharUuid = CASA_AUTH_CHAR_UUID
             self._classicHeaderMode = "conformant"
+            self._classicHashSource = "ca52_0001"
             self._classicConnHash8 = bytes(first[:8])
             self._classicCmdDiv = int.from_bytes(os.urandom(1), "big") or 1
             self._classicTxSeq = 0
+
+            # Probe mapped Classic CA51 (0002) for diagnostics; some firmwares use it for time/config.
+            try:
+                v = await self._gattClient.read_gatt_char(CASA_CLASSIC_CONFORMANT_CA51_CHAR_UUID)
+                c0002_prefix = b2a(v[:10]) if v else None
+                if self._logger.isEnabledFor(logging.DEBUG):
+                    self._logger.debug(
+                        "[CASAMBI_GATT_PROBE] read classic-0002 ok len=%d prefix=%s",
+                        0 if v is None else len(v),
+                        c0002_prefix,
+                    )
+            except Exception as e:
+                c0002_err = type(e).__name__
+                if self._logger.isEnabledFor(logging.DEBUG):
+                    self._logger.debug(
+                        "[CASAMBI_GATT_PROBE] read classic-0002 fail err=%s",
+                        c0002_err,
+                    )
 
             notify_kwargs: dict[str, Any] = {}
             notify_params = inspect.signature(self._gattClient.start_notify).parameters
             if "bluez" in notify_params:
                 notify_kwargs["bluez"] = {"use_start_notify": True}
-            await self._gattClient.start_notify(
-                CASA_AUTH_CHAR_UUID,
-                self._queueCallback,
-                **notify_kwargs,
-            )
+            try:
+                await self._gattClient.start_notify(
+                    CASA_AUTH_CHAR_UUID,
+                    self._queueCallback,
+                    **notify_kwargs,
+                )
+            except Exception as e:
+                ca52_notify_err = type(e).__name__
+            else:
+                self._classicNotifyCharUuids.add(CASA_AUTH_CHAR_UUID.lower())
+
+            # Probe mapped Classic CA53 (0003) notify: some firmwares may emit state/config here.
+            try:
+                await self._gattClient.start_notify(
+                    CASA_CLASSIC_CONFORMANT_CA53_CHAR_UUID,
+                    self._queueCallback,
+                    **notify_kwargs,
+                )
+            except Exception as e:
+                c0003_notify_err = type(e).__name__
+            else:
+                self._classicNotifyCharUuids.add(CASA_CLASSIC_CONFORMANT_CA53_CHAR_UUID.lower())
+
             self._connectionState = ConnectionState.AUTHENTICATED
             self._logger.info("Protocol mode selected: CLASSIC")
             if self._logger.isEnabledFor(logging.DEBUG):
-                self._logger.debug("[CASAMBI_GATT_PROBE] start_notify auth ok (classic conformant)")
+                if ca52_notify_err is None:
+                    self._logger.debug("[CASAMBI_GATT_PROBE] start_notify auth ok (classic conformant)")
+                else:
+                    self._logger.debug(
+                        "[CASAMBI_GATT_PROBE] start_notify auth fail err=%s (classic conformant)",
+                        ca52_notify_err,
+                    )
                 self._logger.debug(
                     "[CASAMBI_CLASSIC_CONN_HASH] len=%d hash=%s",
                     len(self._classicConnHash8),
                     b2a(self._classicConnHash8),
                 )
             self._logger.warning(
-                "[CASAMBI_CLASSIC_SELECTED] address=%s variant=auth_uuid_conformant data_uuid=%s start_notify_uuid=%s header_mode=%s conn_hash8_prefix=%s",
+                "[CASAMBI_CLASSIC_SELECTED] address=%s variant=auth_uuid_conformant data_uuid=%s tx_uuid=%s notify_uuids=%s header_mode=%s conn_hash8_prefix=%s",
                 self.address,
                 self._dataCharUuid,
-                CASA_AUTH_CHAR_UUID,
+                self._classicTxCharUuid,
+                sorted(self._classicNotifyCharUuids) if self._classicNotifyCharUuids else None,
                 self._classicHeaderMode,
                 b2a(self._classicConnHash8),
             )
@@ -476,6 +588,7 @@ class CasambiClient:
                 getattr(self._network, "isManager", lambda: False)(),
             )
             _log_probe_summary("CLASSIC", classic_variant="auth_uuid_conformant")
+            self._classicNoRxTask = asyncio.create_task(self._classic_no_rx_watchdog(30.0))
             return
 
         _log_probe_summary("UNKNOWN")
@@ -483,12 +596,45 @@ class CasambiClient:
             "No supported Casambi characteristics found (Classic ca51/ca52 or EVO/Classic-conformant auth char)."
         )
 
+    async def _classic_no_rx_watchdog(self, after_s: float) -> None:
+        """Emit one high-signal log if Classic RX stays silent after connect.
+
+        This helps testers capture actionable logs when Classic control/updates don't work yet.
+        """
+        try:
+            await asyncio.sleep(after_s)
+            if self._protocolMode != ProtocolMode.CLASSIC:
+                return
+            if self._classicFirstRxTs is not None:
+                return
+
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_NO_RX] after_s=%s notify_uuids=%s tx_uuid=%s header_mode=%s "
+                "conn_hash8_prefix=%s visitor=%s manager=%s cloud_session_is_manager=%s",
+                after_s,
+                sorted(self._classicNotifyCharUuids) if self._classicNotifyCharUuids else None,
+                self._classicTxCharUuid,
+                self._classicHeaderMode,
+                None if self._classicConnHash8 is None else b2a(self._classicConnHash8),
+                self._network.classicVisitorKey() is not None,
+                self._network.classicManagerKey() is not None,
+                getattr(self._network, "isManager", lambda: False)(),
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            # Never fail the connection because of diagnostics.
+            self._logger.debug("Classic no-RX watchdog failed.", exc_info=True)
+
     def _on_disconnect(self, client: BleakClient) -> None:
         if self._connectionState != ConnectionState.NONE:
             self._logger.info(f"Received disconnect callback from {self.address}")
         if self._connectionState == ConnectionState.AUTHENTICATED:
             self._logger.debug("Executing disconnect callback.")
             self._disconnectedCallback()
+        if self._classicNoRxTask is not None:
+            self._classicNoRxTask.cancel()
+            self._classicNoRxTask = None
         self._connectionState = ConnectionState.NONE
 
     async def exchangeKey(self) -> None:
@@ -862,8 +1008,9 @@ class CasambiClient:
         self._checkState(ConnectionState.AUTHENTICATED)
         if self._protocolMode != ProtocolMode.CLASSIC:
             raise ProtocolError("Classic send called while not in Classic protocol mode.")
-        if not self._dataCharUuid:
-            raise ProtocolError("Classic data characteristic UUID not set.")
+        tx_uuid = self._classicTxCharUuid or self._dataCharUuid
+        if not tx_uuid:
+            raise ProtocolError("Classic TX characteristic UUID not set.")
         if self._classicConnHash8 is None:
             raise ClassicHandshakeError("Classic connection hash not available.")
 
@@ -974,12 +1121,13 @@ class CasambiClient:
         if self._logLimiter.allow("classic_tx", burst=50, window_s=60.0):
             auth_str = f"0x{auth_level:02x}" if header_mode == "conformant" else None
             self._logger.warning(
-                "[CASAMBI_CLASSIC_TX] header=%s key=%s signed=%s auth=%s sig_len=%d seq=%s "
+                "[CASAMBI_CLASSIC_TX] header=%s key=%s signed=%s tx_uuid=%s auth=%s sig_len=%d seq=%s "
                 "cmd_len=%d cmd_ord=%s target=%s div=%s lifetime=%s payload_len=%s "
                 "total_len=%d prefix=%s",
                 header_mode,
                 key_name,
                 signed,
+                tx_uuid,
                 auth_str,
                 sig_len,
                 None if seq is None else f"0x{seq:04x}",
@@ -995,11 +1143,20 @@ class CasambiClient:
 
         # Classic packets can exceed 20 bytes when using a 16-byte manager signature.
         # Bleak needs a write-with-response for long writes on most backends.
-        await self._gattClient.write_gatt_char(self._dataCharUuid, bytes(pkt), response=True)
+        await self._gattClient.write_gatt_char(tx_uuid, bytes(pkt), response=True)
 
     def _establishedNofityCallback(
         self, handle: BleakGATTCharacteristic, data: bytes
     ) -> None:
+        # Route notifications based on characteristic UUID when available.
+        # This helps with mixed/legacy setups where multiple Classic channels might be active.
+        try:
+            handle_uuid = str(getattr(handle, "uuid", "")).lower()
+        except Exception:
+            handle_uuid = ""
+        if handle_uuid and handle_uuid in self._classicNotifyCharUuids:
+            self._classicEstablishedNotifyCallback(handle, data)
+            return
         if self._protocolMode == ProtocolMode.CLASSIC:
             self._classicEstablishedNotifyCallback(handle, data)
             return
@@ -1074,6 +1231,8 @@ class CasambiClient:
         """
         self._inPacketCount += 1
         self._classicRxFrames += 1
+        if self._classicFirstRxTs is None:
+            self._classicFirstRxTs = time.monotonic()
 
         raw = bytes(data)
         if self._logger.isEnabledFor(logging.DEBUG):
@@ -1680,6 +1839,10 @@ class CasambiClient:
 
     async def disconnect(self) -> None:
         self._logger.info("Disconnecting...")
+
+        if self._classicNoRxTask is not None:
+            self._classicNoRxTask.cancel()
+            self._classicNoRxTask = None
 
         if self._callbackTask is not None:
             # Cancel and await the background callback task to avoid

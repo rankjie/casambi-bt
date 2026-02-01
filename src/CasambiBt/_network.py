@@ -291,7 +291,7 @@ class Network:
                         "[CASAMBI_CLOUD_UPDATE_RETRY] status=400 retry_with_token_clientInfo=true body_prefix=%r",
                         (res.text or "")[:200],
                     )
-                    payload2 = dict(payload)
+                    payload2: dict[str, Any] = dict(payload)
                     payload2["token"] = self._token
                     payload2["clientInfo"] = self._clientInfo
                     res = await self._httpClient.put(
@@ -301,26 +301,33 @@ class Network:
                     )
 
                 if res.status_code != httpx.codes.OK:
-                    self._logger.error(
-                        "Update failed: %s body_prefix=%r",
+                    body_prefix = (res.text or "")[:500]
+                    # If we have cached network data, do not fail setup; continue offline.
+                    # This is important for HA stability and for "cloud down / API changed" scenarios.
+                    have_cache = bool(self._networkRevision and self._networkRevision > 0 and self._rawNetworkData)
+                    self._logger.warning(
+                        "[CASAMBI_CLOUD_UPDATE_FAILED] status=%s cached_revision=%s continuing_offline=%s body_prefix=%r",
                         res.status_code,
-                        (res.text or "")[:500],
+                        self._networkRevision,
+                        have_cache,
+                        body_prefix,
                     )
-                    raise NetworkUpdateError("Could not update network!")
+                    if not have_cache:
+                        raise NetworkUpdateError("Could not update network!")
+                else:
+                    self._logger.debug(f"Network: {res.text}")
 
-                self._logger.debug(f"Network: {res.text}")
-
-                updateResult = res.json()
-                if updateResult["status"] != "UPTODATE":
-                    self._networkRevision = updateResult["network"]["revision"]
-                    self._rawNetworkData = updateResult
-                    async with self._cache as cachePath:
-                        cachedNetworkPah = cachePath / f"{self._id}.json"
-                        await cachedNetworkPah.write_bytes(res.content)
-                    network = updateResult
-                    self._logger.info(
-                        f"Fetched updated network with revision {self._networkRevision}"
-                    )
+                    updateResult = res.json()
+                    if updateResult["status"] != "UPTODATE":
+                        self._networkRevision = updateResult["network"]["revision"]
+                        self._rawNetworkData = updateResult
+                        async with self._cache as cachePath:
+                            cachedNetworkPah = cachePath / f"{self._id}.json"
+                            await cachedNetworkPah.write_bytes(res.content)
+                        network = updateResult
+                        self._logger.info(
+                            f"Fetched updated network with revision {self._networkRevision}"
+                        )
             except RequestError as err:
                 if self._networkRevision == 0:
                     raise NetworkUpdateError from err
