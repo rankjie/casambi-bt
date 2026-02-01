@@ -262,16 +262,16 @@ class Network:
             getNetworkUrl = f"https://api.casambi.com/network/{self._id}/"
 
             try:
+                payload = {
+                    "formatVersion": 1,
+                    "deviceName": DEVICE_NAME,
+                    "revision": self._networkRevision,
+                }
+
                 # **SECURITY**: Do not set session header for client! This could leak the session with external clients.
                 res = await self._httpClient.put(
                     getNetworkUrl,
-                    json={
-                        "formatVersion": 1,
-                        "token": self._token,
-                        "deviceName": DEVICE_NAME,
-                        "clientInfo": self._clientInfo,
-                        "revision": self._networkRevision,
-                    },
+                    json=payload,
                     headers={"X-Casambi-Session": self._session.session},  # type: ignore[union-attr]
                 )
 
@@ -284,8 +284,28 @@ class Network:
                     )
                     await self._cache.invalidateCache()
 
+                if res.status_code == httpx.codes.BAD_REQUEST:
+                    # Some backend variants may reject the minimal update payload.
+                    # Retry once with Android-like fields (token/clientInfo) for diagnostics/testing.
+                    self._logger.warning(
+                        "[CASAMBI_CLOUD_UPDATE_RETRY] status=400 retry_with_token_clientInfo=true body_prefix=%r",
+                        (res.text or "")[:200],
+                    )
+                    payload2 = dict(payload)
+                    payload2["token"] = self._token
+                    payload2["clientInfo"] = self._clientInfo
+                    res = await self._httpClient.put(
+                        getNetworkUrl,
+                        json=payload2,
+                        headers={"X-Casambi-Session": self._session.session},  # type: ignore[union-attr]
+                    )
+
                 if res.status_code != httpx.codes.OK:
-                    self._logger.error(f"Update failed: {res.status_code}\n{res.text}")
+                    self._logger.error(
+                        "Update failed: %s body_prefix=%r",
+                        res.status_code,
+                        (res.text or "")[:500],
+                    )
                     raise NetworkUpdateError("Could not update network!")
 
                 self._logger.debug(f"Network: {res.text}")
