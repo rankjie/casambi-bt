@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import struct
+import time
 from binascii import b2a_hex as b2a
 from collections.abc import Callable
 from enum import Enum, IntEnum, auto, unique
@@ -52,6 +53,28 @@ class IncommingPacketType(IntEnum):
 class ProtocolMode(Enum):
     EVO = auto()
     CLASSIC = auto()
+
+
+class _LogBurstLimiter:
+    """Simple in-process log rate limiter (per key).
+
+    Home Assistant warns if a logger emits too many messages. We keep some high-signal
+    WARNING logs for Classic reverse engineering but avoid spamming.
+    """
+
+    def __init__(self) -> None:
+        self._state: dict[str, tuple[float, int]] = {}
+
+    def allow(self, key: str, *, burst: int, window_s: float) -> bool:
+        now = time.monotonic()
+        start, count = self._state.get(key, (now, 0))
+        if (now - start) > window_s:
+            start, count = now, 0
+        if count >= burst:
+            self._state[key] = (start, count)
+            return False
+        self._state[key] = (start, count + 1)
+        return True
 
 
 MIN_VERSION: Final[int] = 10
@@ -107,28 +130,25 @@ class CasambiClient:
         self._classicConnHash8: bytes | None = None
         self._classicTxSeq: int = 0  # 16-bit sequence number (big endian on the wire)
         self._classicCmdDiv: int = 0  # 8-bit per-command divider/id (matches u1.C1751c.b0)
+        # Classic header framing mode:
+        # - "conformant": [auth][sig][seq16][payload]
+        # - "legacy":     [sig][payload]
+        # Ground truth: casambi-android `t1.P.n(...)` and `t1.P.o(...)`.
+        self._classicHeaderMode: str | None = None  # "conformant" | "legacy"
 
-        # Avoid log spam in Home Assistant: raw notify hexdumps are opt-in.
-        self._logRawNotifies: bool = os.getenv("CASAMBI_BT_LOG_RAW_NOTIFIES", "").strip() in {
-            "1",
-            "true",
-            "TRUE",
-            "yes",
-            "YES",
-        }
+        # Rate limit WARNING logs (especially Classic RX) to keep HA usable.
+        self._logLimiter = _LogBurstLimiter()
+        self._classicRxFrames = 0
+        self._classicRxVerified = 0
+        self._classicRxUnverifiable = 0
+        self._classicRxParseFail = 0
+        self._classicRxLastStatsTs = time.monotonic()
 
     @property
     def protocolMode(self) -> ProtocolMode | None:
         return self._protocolMode
 
     def _checkProtocolVersion(self, version: int, *, source: str = "unknown") -> None:
-        strict = os.getenv("CASAMBI_BT_STRICT_PROTOCOL_VERSION", "").strip() in {
-            "1",
-            "true",
-            "TRUE",
-            "yes",
-            "YES",
-        }
         if version < MIN_VERSION:
             # Legacy protocol versions are intentionally allowed. We keep this check as a warning
             # because packet layouts/handshakes may differ and we want actionable tester logs.
@@ -136,8 +156,6 @@ class CasambiClient:
                 f"Legacy protocol version detected ({source}={version}). "
                 f"Versions < {MIN_VERSION} are not fully verified; attempting to continue."
             )
-            if strict:
-                raise UnsupportedProtocolVersion(msg)
             self._logger.warning(msg)
             return
         if version > MAX_VERSION:
@@ -243,8 +261,8 @@ class CasambiClient:
 
         def _log_probe_summary(mode: str) -> None:
             # One stable, high-signal line for testers.
-            self._logger.info(
-                "[CASAMBI_PROTOCOL_PROBE] address=%s mode=%s cloud_protocol=%s device_nodeinfo_protocol=%s "
+            self._logger.warning(
+                "[CASAMBI_PROTOCOL_PROBE] address=%s mode=%s cloud_protocol=%s nodeinfo_b1=%s "
                 "data_uuid=%s classic_hash8_present=%s auth_read_prefix=%s ca51_read_prefix=%s ca51_read_error=%s auth_read_error=%s",
                 self.address,
                 mode,
@@ -275,16 +293,9 @@ class CasambiClient:
                 self._logger.debug("[CASAMBI_GATT_PROBE] read ca51 fail err=%s", ca51_err)
 
         if classic_hash and len(classic_hash) >= 8:
-            if os.getenv("CASAMBI_BT_DISABLE_CLASSIC", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
-                raise ProtocolError("Classic protocol detected but disabled via CASAMBI_BT_DISABLE_CLASSIC=1")
-
-            if not self._network.hasClassicKeys():
-                raise ClassicKeysMissingError(
-                    "Classic protocol detected but network has no visitorKey/managerKey."
-                )
-
             self._protocolMode = ProtocolMode.CLASSIC
             self._dataCharUuid = CASA_CLASSIC_DATA_CHAR_UUID
+            self._classicHeaderMode = "legacy"
 
             # Read connection hash (first 8 bytes are used for CMAC signing).
             raw_hash = classic_hash
@@ -368,7 +379,7 @@ class CasambiClient:
                         self._logger.debug("Failed to parse NodeInfo fields for logging.", exc_info=True)
 
             self._logger.info(
-                "[CASAMBI_EVO_NODEINFO] cloud_protocol=%s device_protocol=%s mtu=%s unit=%s flags=%s nonce_prefix=%s len=%d prefix=%s",
+                "[CASAMBI_EVO_NODEINFO] cloud_protocol=%s nodeinfo_b1=%s mtu=%s unit=%s flags=%s nonce_prefix=%s len=%d prefix=%s",
                 cloud_protocol,
                 device_nodeinfo_protocol,
                 mtu,
@@ -378,15 +389,9 @@ class CasambiClient:
                 len(first),
                 b2a(first[: min(len(first), 32)]),
             )
-            if cloud_protocol is not None and device_nodeinfo_protocol != cloud_protocol:
-                self._logger.warning(
-                    "[CASAMBI_EVO_NODEINFO_MISMATCH] cloud_protocol=%s device_protocol=%s",
-                    cloud_protocol,
-                    device_nodeinfo_protocol,
-                )
             if len(first) < 23:
                 self._logger.warning(
-                    "[CASAMBI_EVO_NODEINFO_SHORT] len=%d cloud_protocol=%s device_protocol=%s prefix=%s",
+                    "[CASAMBI_EVO_NODEINFO_SHORT] len=%d cloud_protocol=%s nodeinfo_b1=%s prefix=%s",
                     len(first),
                     cloud_protocol,
                     device_nodeinfo_protocol,
@@ -395,19 +400,13 @@ class CasambiClient:
 
             self._protocolMode = ProtocolMode.EVO
             self._dataCharUuid = CASA_AUTH_CHAR_UUID
-            self._checkProtocolVersion(device_nodeinfo_protocol, source="device_nodeinfo")
+            self._classicHeaderMode = None
             self._logger.info("Protocol mode selected: EVO")
             _log_probe_summary("EVO")
             return
 
         if first is not None:
             # Otherwise, treat as Classic conformant: read provides connection hash.
-            if os.getenv("CASAMBI_BT_DISABLE_CLASSIC", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
-                raise ProtocolError("Classic protocol detected but disabled via CASAMBI_BT_DISABLE_CLASSIC=1")
-            if not self._network.hasClassicKeys():
-                raise ClassicKeysMissingError(
-                    "Classic protocol detected but network has no visitorKey/managerKey."
-                )
             if len(first) < 8:
                 raise ClassicHandshakeError(
                     f"Classic connection hash read failed/too short (len={len(first)})."
@@ -415,6 +414,7 @@ class CasambiClient:
 
             self._protocolMode = ProtocolMode.CLASSIC
             self._dataCharUuid = CASA_AUTH_CHAR_UUID
+            self._classicHeaderMode = "conformant"
             self._classicConnHash8 = bytes(first[:8])
             self._classicCmdDiv = int.from_bytes(os.urandom(1), "big") or 1
             self._classicTxSeq = 0
@@ -440,6 +440,7 @@ class CasambiClient:
             _log_probe_summary("CLASSIC")
             return
 
+        _log_probe_summary("UNKNOWN")
         raise ProtocolError(
             "No supported Casambi characteristics found (Classic ca51/ca52 or EVO/Classic-conformant auth char)."
         )
@@ -469,7 +470,6 @@ class CasambiClient:
                 )
 
             cloud_protocol = getattr(self._network, "protocolVersion", None)
-            expected_protocol = self._deviceProtocolVersion or cloud_protocol
 
             # EVO key exchange expects the NodeInfo packet (0x01 ...).
             if len(firstResp) < 2 or firstResp[0] != 0x01:
@@ -482,27 +482,12 @@ class CasambiClient:
 
             device_protocol = firstResp[1]
             self._deviceProtocolVersion = device_protocol
-            self._checkProtocolVersion(device_protocol, source="device_nodeinfo")
-
-            if expected_protocol is not None and device_protocol != expected_protocol:
-                self._logger.warning(
-                    "[CASAMBI_EVO_NODEINFO_MISMATCH] expected_protocol=%s cloud_protocol=%s device_protocol=%s",
-                    expected_protocol,
-                    cloud_protocol,
-                    device_protocol,
-                )
-            elif cloud_protocol is not None and device_protocol != cloud_protocol:
-                # Keep this separate to catch cloud/device mismatches even if we didn't have an expected protocol set.
-                self._logger.warning(
-                    "[CASAMBI_EVO_NODEINFO_MISMATCH] expected_protocol=%s cloud_protocol=%s device_protocol=%s",
-                    expected_protocol,
-                    cloud_protocol,
-                    device_protocol,
-                )
+            # Do not interpret NodeInfo byte1 as "cloud protocolVersion".
+            # Some firmwares use a different numbering scheme, so mismatch warnings are misleading.
 
             if len(firstResp) < 23:
                 self._logger.error(
-                    "[CASAMBI_EVO_NODEINFO_SHORT] len=%d cloud_protocol=%s device_protocol=%s prefix=%s",
+                    "[CASAMBI_EVO_NODEINFO_SHORT] len=%d cloud_protocol=%s nodeinfo_b1=%s prefix=%s",
                     len(firstResp),
                     cloud_protocol,
                     device_protocol,
@@ -598,14 +583,6 @@ class CasambiClient:
     def _callbackMulitplexer(
         self, handle: BleakGATTCharacteristic, data: bytes
     ) -> None:
-        if self._logRawNotifies and self._logger.isEnabledFor(logging.DEBUG):
-            self._logger.debug(
-                "Callback on handle %s (%s): %s",
-                getattr(handle, "handle", "?"),
-                getattr(handle, "uuid", "?"),
-                b2a(data),
-            )
-
         if self._connectionState == ConnectionState.CONNECTED:
             self._exchNofityCallback(handle, data)
         elif self._connectionState == ConnectionState.KEY_EXCHANGED:
@@ -747,7 +724,7 @@ class CasambiClient:
         # EVO sends INVOCATION operations (packet type=0x07) inside the encrypted channel.
         # Classic sends signed command frames on the CA52 channel.
         if self._protocolMode == ProtocolMode.CLASSIC:
-            await self._sendClassicSigned(packet)
+            await self._sendClassic(packet)
             return
 
         self._checkState(ConnectionState.AUTHENTICATED)
@@ -843,7 +820,7 @@ class CasambiClient:
 
         return bytes(b)
 
-    async def _sendClassicSigned(self, command_bytes: bytes, *, use_manager: bool | None = None) -> None:
+    async def _sendClassic(self, command_bytes: bytes) -> None:
         self._checkState(ConnectionState.AUTHENTICATED)
         if self._protocolMode != ProtocolMode.CLASSIC:
             raise ProtocolError("Classic send called while not in Classic protocol mode.")
@@ -852,72 +829,85 @@ class CasambiClient:
         if self._classicConnHash8 is None:
             raise ClassicHandshakeError("Classic connection hash not available.")
 
-        # Decide whether to use visitor or manager key.
-        if use_manager is None:
-            use_manager = os.getenv("CASAMBI_BT_CLASSIC_USE_MANAGER", "").strip() in {
-                "1",
-                "true",
-                "TRUE",
-                "yes",
-                "YES",
-            }
-
         visitor_key = self._network.classicVisitorKey()
         manager_key = self._network.classicManagerKey()
 
-        key_name = "visitor"
-        auth_level = 0x02
-        sig_len = 4
-        key = visitor_key
+        # Key selection mirrors Android's intent:
+        # - Use manager key if our cloud session is manager and a managerKey exists.
+        # - Else use visitor key if present.
+        # - Else fall back to manager key if present.
+        # - Else send an unsigned frame (signature bytes remain zeros), which Android does when keys are null.
+        key_name = "none"
+        auth_level = 0x02  # visitor by default
+        key = None
+        if manager_key is not None and getattr(self._network, "isManager", lambda: False)():
+            key_name = "manager"
+            auth_level = 0x03
+            key = manager_key
+        elif visitor_key is not None:
+            key_name = "visitor"
+            auth_level = 0x02
+            key = visitor_key
+        elif manager_key is not None:
+            key_name = "manager"
+            auth_level = 0x03
+            key = manager_key
 
-        if use_manager or key is None:
-            if manager_key is None:
-                # If we were forced to use manager but don't have one, fall back to visitor if present.
-                if visitor_key is None:
-                    raise ClassicKeysMissingError(
-                        "Classic network has no visitorKey/managerKey available."
-                    )
-                key = visitor_key
-            else:
-                key_name = "manager"
-                auth_level = 0x03
-                sig_len = 16
-                key = manager_key
+        header_mode = self._classicHeaderMode or "conformant"
 
-        seq = self._classic_next_seq()
-
-        # Header layout (rVar.Z=true / "conformant" classic):
-        #   [0] auth_level (2 visitor / 3 manager)
-        #   [1..sig_len] CMAC prefix placeholder (filled after CMAC computation)
-        #   [1+sig_len .. 1+sig_len+1] 16-bit sequence, big endian (included in CMAC input)
-        #   [..] command bytes
+        seq: int | None = None
+        sig_len: int
         pkt = bytearray()
-        pkt.append(auth_level)
-        pkt.extend(b"\x00" * sig_len)
-        pkt.extend(b"\x00\x00")
-        pkt.extend(command_bytes)
 
-        seq_off = 1 + sig_len
-        pkt[seq_off] = (seq >> 8) & 0xFF
-        pkt[seq_off + 1] = seq & 0xFF
+        if header_mode == "conformant":
+            sig_len = 16 if auth_level == 0x03 else 4
+            seq = self._classic_next_seq()
 
-        cmac_input = bytes(pkt[seq_off:])  # includes seq + command bytes
-        prefix = classic_cmac_prefix(key, self._classicConnHash8, cmac_input, sig_len)
-        pkt[1 : 1 + sig_len] = prefix
+            # Header layout (rVar.Z=true / "conformant" classic):
+            #   [0] auth_level (2 visitor / 3 manager)
+            #   [1..sig_len] CMAC prefix placeholder (filled after CMAC computation)
+            #   [1+sig_len .. 1+sig_len+1] 16-bit sequence, big endian (included in CMAC input)
+            #   [..] command bytes
+            pkt.append(auth_level)
+            pkt.extend(b"\x00" * sig_len)
+            pkt.extend(b"\x00\x00")
+            pkt.extend(command_bytes)
 
-        if self._logger.isEnabledFor(logging.DEBUG):
-            self._logger.debug(
-                "[CASAMBI_CLASSIC_TX] key=%s auth=0x%02x sig_len=%d seq=0x%04x cmd_len=%d total_len=%d",
+            seq_off = 1 + sig_len
+            pkt[seq_off] = (seq >> 8) & 0xFF
+            pkt[seq_off + 1] = seq & 0xFF
+
+            if key is not None:
+                cmac_input = bytes(pkt[seq_off:])  # includes seq + command bytes
+                prefix = classic_cmac_prefix(key, self._classicConnHash8, cmac_input, sig_len)
+                pkt[1 : 1 + sig_len] = prefix
+
+        elif header_mode == "legacy":
+            # Legacy/non-conformant classic: only a 4-byte CMAC prefix, no auth byte, no seq.
+            sig_len = 4
+            pkt.extend(b"\x00" * sig_len)
+            pkt.extend(command_bytes)
+
+            if key is not None:
+                cmac_input = bytes(command_bytes)
+                prefix = classic_cmac_prefix(key, self._classicConnHash8, cmac_input, sig_len)
+                pkt[0:sig_len] = prefix
+        else:
+            raise ProtocolError(f"Unknown Classic header mode: {header_mode}")
+
+        # WARNING-level TX logs are intentional: they are needed for Classic reverse engineering.
+        # Keep payload logging minimal (prefix only).
+        if self._logLimiter.allow("classic_tx", burst=50, window_s=60.0):
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_TX] header=%s key=%s auth=0x%02x sig_len=%d seq=%s cmd_len=%d total_len=%d prefix=%s",
+                header_mode,
                 key_name,
                 auth_level,
                 sig_len,
-                seq,
+                None if seq is None else f"0x{seq:04x}",
                 len(command_bytes),
                 len(pkt),
-            )
-            self._logger.debug(
-                "[CASAMBI_CLASSIC_TX_RAW] %s",
-                b2a(bytes(pkt[: min(len(pkt), 64)])) + (b"..." if len(pkt) > 64 else b""),
+                b2a(bytes(pkt[: min(len(pkt), 24)])),
             )
 
         # Classic packets can exceed 20 bytes when using a 16-byte manager signature.
@@ -1000,6 +990,7 @@ class CasambiClient:
         Ground truth: casambi-android `t1.P.o(...)`.
         """
         self._inPacketCount += 1
+        self._classicRxFrames += 1
 
         raw = bytes(data)
         if self._logger.isEnabledFor(logging.DEBUG):
@@ -1010,68 +1001,225 @@ class CasambiClient:
             )
 
         if self._classicConnHash8 is None:
-            self._logger.debug("[CASAMBI_CLASSIC_RX] Missing connection hash; cannot verify CMAC.")
+            if self._logLimiter.allow("classic_rx_no_hash", burst=5, window_s=60.0):
+                self._logger.warning("[CASAMBI_CLASSIC_RX] missing_connection_hash len=%d", len(raw))
             return
 
         visitor_key = self._network.classicVisitorKey()
         manager_key = self._network.classicManagerKey()
 
-        verified = False
-        key_name: str | None = None
-        sig_len: int | None = None
-        payload_with_seq: bytes | None = None
+        def _plausible_payload(payload: bytes) -> bool:
+            if not payload:
+                return False
+            if payload[0] in (
+                IncommingPacketType.UnitState,
+                IncommingPacketType.SwitchEvent,
+                IncommingPacketType.NetworkConfig,
+            ):
+                return True
+            # Classic command record stream: record[0] = (len+239) mod 256
+            if len(payload) >= 2:
+                rec_len = (payload[0] - 239) & 0xFF
+                if 2 <= rec_len <= len(payload):
+                    return True
+            return False
 
-        # Try visitor (4-byte prefix) first, then manager (16-byte prefix).
-        # Some frames may be unsigned; in that case verification will fail and we'll fall back.
-        candidates: list[tuple[str, bytes | None, int]] = [
-            ("visitor", visitor_key, 4),
-            ("manager", manager_key, 16),
-        ]
+        def _score(verified: bool | None, payload: bytes) -> int:
+            plausible = _plausible_payload(payload)
+            if verified is True:
+                return 100
+            if plausible and verified is None:
+                return 50
+            if plausible and verified is False:
+                return 20
+            return 0
 
-        for name, key, slen in candidates:
+        def _parse_conformant(raw_bytes: bytes) -> dict[str, Any] | None:
+            if len(raw_bytes) < 1 + 4 + 2:
+                return None
+            auth_level = raw_bytes[0]
+            if auth_level == 0x02:
+                sig_len = 4
+                key_name = "visitor"
+                key = visitor_key
+            elif auth_level == 0x03:
+                sig_len = 16
+                key_name = "manager"
+                key = manager_key
+            else:
+                return None
+
+            header_len = 1 + sig_len + 2
+            if len(raw_bytes) < header_len:
+                return None
+
+            sig = raw_bytes[1 : 1 + sig_len]
+            cmac_input = raw_bytes[1 + sig_len :]  # seq(2) + payload
+            seq = int.from_bytes(cmac_input[:2], byteorder="big", signed=False)
+            payload = cmac_input[2:]
+
+            verified: bool | None
             if key is None:
-                continue
-            header_len = 1 + slen + 2
-            if len(raw) < header_len:
-                continue
+                verified = None
+            else:
+                try:
+                    expected = classic_cmac_prefix(key, self._classicConnHash8, cmac_input, sig_len)
+                except Exception:
+                    verified = False
+                else:
+                    verified = expected == sig
 
-            auth_level = raw[0]
-            sig = raw[1 : 1 + slen]
-            cmac_input = raw[1 + slen :]  # seq(2) + payload
+            return {
+                "mode": "conformant",
+                "auth_level": auth_level,
+                "sig_len": sig_len,
+                "seq": seq,
+                "key_name": key_name if key is not None else None,
+                "verified": verified,
+                "payload": payload,
+            }
 
-            try:
-                expected = classic_cmac_prefix(key, self._classicConnHash8, cmac_input, slen)
-            except Exception:
-                continue
+        def _parse_legacy(raw_bytes: bytes, *, sig_len: int) -> dict[str, Any] | None:
+            if len(raw_bytes) < sig_len + 1:
+                return None
+            sig = raw_bytes[:sig_len]
+            payload = raw_bytes[sig_len:]
 
-            if expected == sig:
-                verified = True
-                key_name = name
-                sig_len = slen
-                payload_with_seq = cmac_input
-                if self._logger.isEnabledFor(logging.DEBUG):
-                    seq = int.from_bytes(cmac_input[:2], byteorder="big", signed=False)
-                    self._logger.debug(
-                        "[CASAMBI_CLASSIC_RX_VERIFY] ok key=%s auth=0x%02x sig_len=%d seq=0x%04x",
-                        name,
-                        auth_level,
-                        slen,
-                        seq,
-                    )
-                break
+            # In non-conformant mode Android still selects visitor/manager key for CMAC,
+            # but the header contains only the CMAC prefix (typically 4 bytes).
+            verified: bool | None = None
+            key_name: str | None = None
 
-        if not verified:
-            if self._logger.isEnabledFor(logging.DEBUG):
-                self._logger.debug("[CASAMBI_CLASSIC_RX_VERIFY] failed (no matching CMAC prefix)")
-            # Best-effort: treat raw bytes as payload.
-            payload = raw
+            keys_to_try: list[tuple[str, bytes | None]] = [
+                ("visitor", visitor_key),
+                ("manager", manager_key),
+            ]
+            any_key = any(k is not None for _, k in keys_to_try)
+            if any_key:
+                verified = False
+                for nm, key in keys_to_try:
+                    if key is None:
+                        continue
+                    try:
+                        expected = classic_cmac_prefix(key, self._classicConnHash8, payload, sig_len)
+                    except Exception:
+                        continue
+                    if expected == sig:
+                        verified = True
+                        key_name = nm
+                        break
+
+            return {
+                "mode": "legacy",
+                "auth_level": None,
+                "sig_len": sig_len,
+                "seq": None,
+                "key_name": key_name,
+                "verified": verified,
+                "payload": payload,
+            }
+
+        # Try the currently selected header mode first, then fall back.
+        # Some mixed/legacy setups differ between CA52 (legacy) and auth-UUID (conformant).
+        parsed_candidates: list[dict[str, Any]] = []
+        preferred = self._classicHeaderMode or "conformant"
+        if preferred == "legacy":
+            for sl in (4, 16):
+                r = _parse_legacy(raw, sig_len=sl)
+                if r is not None:
+                    parsed_candidates.append(r)
+            r = _parse_conformant(raw)
+            if r is not None:
+                parsed_candidates.append(r)
         else:
-            assert payload_with_seq is not None
-            # Drop the 16-bit sequence from the payload for higher-level parsing.
-            payload = payload_with_seq[2:]
+            r = _parse_conformant(raw)
+            if r is not None:
+                parsed_candidates.append(r)
+            for sl in (4, 16):
+                r = _parse_legacy(raw, sig_len=sl)
+                if r is not None:
+                    parsed_candidates.append(r)
 
-        if not payload:
+        if not parsed_candidates:
+            self._classicRxParseFail += 1
+            if self._logLimiter.allow("classic_rx_parse_fail", burst=5, window_s=60.0):
+                self._logger.warning(
+                    "[CASAMBI_CLASSIC_RX_PARSE_FAIL] len=%d prefix=%s",
+                    len(raw),
+                    b2a(raw[: min(len(raw), 32)]),
+                )
             return
+
+        # Choose best candidate by score; tie-breaker prefers current mode.
+        for c in parsed_candidates:
+            c["score"] = _score(c["verified"], c["payload"])
+
+        parsed_candidates.sort(
+            key=lambda c: (
+                c["score"],
+                1 if c["mode"] == preferred else 0,
+                -c["sig_len"],
+            ),
+            reverse=True,
+        )
+        best = parsed_candidates[0]
+
+        if best["score"] == 0:
+            self._classicRxParseFail += 1
+            if self._logLimiter.allow("classic_rx_unplausible", burst=5, window_s=60.0):
+                self._logger.warning(
+                    "[CASAMBI_CLASSIC_RX_UNPLAUSIBLE] preferred=%s len=%d prefix=%s",
+                    preferred,
+                    len(raw),
+                    b2a(raw[: min(len(raw), 32)]),
+                )
+            return
+
+        payload = best["payload"]
+        verified = best["verified"]
+        if verified is True:
+            self._classicRxVerified += 1
+        elif verified is None:
+            self._classicRxUnverifiable += 1
+
+        # Auto-correct header mode if the other format parses much better.
+        if best["mode"] != preferred:
+            # Only switch if we got a stronger signal (verified or plausible payload with fewer assumptions).
+            if best["score"] >= 50 and self._logLimiter.allow("classic_rx_mode_switch", burst=3, window_s=3600.0):
+                self._logger.warning(
+                    "[CASAMBI_CLASSIC_RX_MODE] switching %s -> %s (score=%d verified=%s sig_len=%d)",
+                    preferred,
+                    best["mode"],
+                    best["score"],
+                    verified,
+                    best["sig_len"],
+                )
+            self._classicHeaderMode = best["mode"]
+
+        # Sample RX logs (limited) + periodic stats (limited).
+        if self._logLimiter.allow("classic_rx_sample", burst=10, window_s=60.0):
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_RX] header=%s verified=%s auth=%s sig_len=%d seq=%s payload_prefix=%s",
+                best["mode"],
+                verified,
+                None if best["auth_level"] is None else f"0x{best['auth_level']:02x}",
+                best["sig_len"],
+                None if best["seq"] is None else f"0x{best['seq']:04x}",
+                b2a(payload[: min(len(payload), 32)]),
+            )
+        now = time.monotonic()
+        if (now - self._classicRxLastStatsTs) > 60.0 and self._logLimiter.allow(
+            "classic_rx_stats", burst=2, window_s=60.0
+        ):
+            self._classicRxLastStatsTs = now
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_RX_STATS] frames=%d verified=%d unverifiable=%d parse_fail=%d header=%s",
+                self._classicRxFrames,
+                self._classicRxVerified,
+                self._classicRxUnverifiable,
+                self._classicRxParseFail,
+                self._classicHeaderMode,
+            )
 
         # If the payload starts with a known EVO packet type, reuse existing parsers.
         packet_type = payload[0]

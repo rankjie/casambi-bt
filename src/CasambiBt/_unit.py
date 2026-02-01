@@ -330,6 +330,7 @@ class Unit:
     :ivar firmwareVersion: Firmware version of the unit.
 
     :ivar unitType: Type of the unit. Determines the capabilities.
+    :ivar securityKey: Optional per-unit key (seen on some legacy/mixed networks). Not used yet.
     """
 
     _typeId: int
@@ -340,6 +341,7 @@ class Unit:
     firmwareVersion: str
 
     unitType: UnitType
+    securityKey: bytes | None = None
 
     _state: UnitState | None = None
     _on: bool = False

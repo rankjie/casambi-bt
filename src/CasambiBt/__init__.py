@@ -3,6 +3,7 @@
 # Import everything that should be public
 # ruff: noqa: F401
 
+from ._version import __version__
 from ._casambi import Casambi
 from ._discover import discover
 from ._unit import (

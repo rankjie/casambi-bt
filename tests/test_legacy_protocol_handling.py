@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 import unittest
 from pathlib import Path
@@ -10,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from CasambiBt._client import CasambiClient, ConnectionState, IncommingPacketType  # noqa: E402
-from CasambiBt.errors import ProtocolError, UnsupportedProtocolVersion  # noqa: E402
+from CasambiBt.errors import ProtocolError  # noqa: E402
 
 
 class _DummyNetwork:
@@ -44,28 +43,8 @@ class TestLegacyProtocolHandling(unittest.TestCase):
             return
 
         c = CasambiClient("00:00:00:00:00:00", cb, lambda: None, _DummyNetwork())
-        old = dict(os.environ)
-        try:
-            os.environ.pop("CASAMBI_BT_STRICT_PROTOCOL_VERSION", None)
-            # Should not raise by default (we want tester logs).
-            c._checkProtocolVersion(5, source="cloud_protocol")
-        finally:
-            os.environ.clear()
-            os.environ.update(old)
-
-    def test_checkProtocolVersion_legacy_can_be_strict(self) -> None:
-        def cb(_: IncommingPacketType, __: dict) -> None:
-            return
-
-        c = CasambiClient("00:00:00:00:00:00", cb, lambda: None, _DummyNetwork())
-        old = dict(os.environ)
-        try:
-            os.environ["CASAMBI_BT_STRICT_PROTOCOL_VERSION"] = "1"
-            with self.assertRaises(UnsupportedProtocolVersion):
-                c._checkProtocolVersion(5, source="cloud_protocol")
-        finally:
-            os.environ.clear()
-            os.environ.update(old)
+        # Should not raise (we want tester logs and best-effort support).
+        c._checkProtocolVersion(5, source="cloud_protocol")
 
 
 class TestExchangeKeyNodeInfoGuards(unittest.IsolatedAsyncioTestCase):
@@ -79,4 +58,3 @@ class TestExchangeKeyNodeInfoGuards(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ProtocolError):
             await c.exchangeKey()
-

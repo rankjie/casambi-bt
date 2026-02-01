@@ -9,7 +9,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from CasambiBt._classic_crypto import classic_cmac, classic_cmac_prefix  # noqa: E402
-from CasambiBt._client import CasambiClient, IncommingPacketType  # noqa: E402
+from CasambiBt._client import (  # noqa: E402
+    CasambiClient,
+    ConnectionState,
+    IncommingPacketType,
+    ProtocolMode,
+)
 
 
 class _DummyNetwork:
@@ -23,6 +28,17 @@ class _DummyNetwork:
 
     def hasClassicKeys(self) -> bool:  # noqa: D401
         return False
+
+    def isManager(self) -> bool:  # noqa: D401
+        return False
+
+
+class _StubGattClient:
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, bytes, bool]] = []
+
+    async def write_gatt_char(self, uuid: str, data: bytes, response: bool = False) -> None:
+        self.writes.append((uuid, bytes(data), bool(response)))
 
 
 class TestClassicProtocolHelpers(unittest.TestCase):
@@ -78,6 +94,63 @@ class TestClassicProtocolHelpers(unittest.TestCase):
         # target_id=0 is treated as "no target" (Android only writes target when > 0).
         cmd3 = c.buildClassicCommand(4, bytes([0xFF]), target_id=0, div=0x01, lifetime=200)
         self.assertEqual(cmd3.hex(), "f44401c8ff")
+
+
+class TestClassicSendWithoutKeys(unittest.IsolatedAsyncioTestCase):
+    async def test_classic_send_conformant_without_keys_has_zero_sig_and_seq(self) -> None:
+        sent: list[tuple[str, bytes, bool]] = []
+
+        def cb(_: IncommingPacketType, __: dict) -> None:
+            return
+
+        c = CasambiClient("00:00:00:00:00:00", cb, lambda: None, _DummyNetwork())
+        c._gattClient = _StubGattClient()
+        c._connectionState = ConnectionState.AUTHENTICATED
+        c._protocolMode = ProtocolMode.CLASSIC
+        c._dataCharUuid = "dummy"
+        c._classicConnHash8 = b"\x11" * 8
+        c._classicHeaderMode = "conformant"
+        c._classicTxSeq = 0
+
+        cmd = c.buildClassicCommand(4, bytes([0xFF]), div=0x01, lifetime=200)
+        await c.send(cmd)
+
+        stub = c._gattClient
+        assert isinstance(stub, _StubGattClient)
+        self.assertEqual(len(stub.writes), 1)
+        _uuid, pkt, response = stub.writes[0]
+        self.assertTrue(response)
+
+        # [auth=0x02][sig(4x00)][seq=0x0001][cmd...]
+        self.assertEqual(pkt[0], 0x02)
+        self.assertEqual(pkt[1:5], b"\x00" * 4)
+        self.assertEqual(pkt[5:7], b"\x00\x01")
+        self.assertEqual(pkt[7:], cmd)
+
+    async def test_classic_send_legacy_without_keys_has_zero_sig(self) -> None:
+        def cb(_: IncommingPacketType, __: dict) -> None:
+            return
+
+        c = CasambiClient("00:00:00:00:00:00", cb, lambda: None, _DummyNetwork())
+        c._gattClient = _StubGattClient()
+        c._connectionState = ConnectionState.AUTHENTICATED
+        c._protocolMode = ProtocolMode.CLASSIC
+        c._dataCharUuid = "dummy"
+        c._classicConnHash8 = b"\x11" * 8
+        c._classicHeaderMode = "legacy"
+
+        cmd = c.buildClassicCommand(4, bytes([0xFF]), div=0x01, lifetime=200)
+        await c.send(cmd)
+
+        stub = c._gattClient
+        assert isinstance(stub, _StubGattClient)
+        self.assertEqual(len(stub.writes), 1)
+        _uuid, pkt, response = stub.writes[0]
+        self.assertTrue(response)
+
+        # [sig(4x00)][cmd...]
+        self.assertEqual(pkt[:4], b"\x00" * 4)
+        self.assertEqual(pkt[4:], cmd)
 
 
 if __name__ == "__main__":

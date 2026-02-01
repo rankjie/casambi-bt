@@ -1,9 +1,10 @@
 import json
 import logging
+import platform
 import pickle
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Final, cast
+from typing import Any, Final, cast
 
 import httpx
 from httpx import AsyncClient, RequestError
@@ -12,6 +13,7 @@ from ._cache import Cache
 from ._constants import DEVICE_NAME
 from ._keystore import KeyStore
 from ._unit import Group, Scene, Unit, UnitControl, UnitControlType, UnitType
+from ._version import __version__
 from .errors import (
     AuthenticationError,
     NetworkNotFoundError,
@@ -63,6 +65,30 @@ class Network:
         self._httpClient = httpClient
 
         self._cache = cache
+
+        # Android always includes a "token" (and typically "clientInfo") in cloud requests.
+        # We keep these stable for the process lifetime to make tester logs comparable.
+        self._token: str = self._make_token()
+        self._clientInfo: dict[str, Any] = self._make_client_info()
+
+    @staticmethod
+    def _make_token() -> str:
+        # Ground truth: casambi-android `w1.o.p(...)` sends `token` for session requests.
+        #
+        # Keep this structured (Android uses "brand/model/device/cpu/unknown") but avoid hostnames/PII.
+        sys = platform.system().lower() or "unknown"
+        machine = platform.machine().lower() or "unknown"
+        return f"python/{sys}/{machine}/unknown/unknown"
+
+    @staticmethod
+    def _make_client_info() -> dict[str, Any]:
+        # Ground truth: casambi-android `w1.o.g(...)` includes `clientInfo`.
+        return {
+            "name": "casambi-bt-revamped",
+            "version": __version__,
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+        }
 
     async def load(self) -> None:
         self._keystore = KeyStore(self._cache)
@@ -150,6 +176,10 @@ class Network:
             return False
         return not self._session.expired()
 
+    def isManager(self) -> bool:
+        """Whether the current cloud session has manager privileges."""
+        return bool(self._session and self._session.manager)
+
     @property
     def keyStore(self) -> KeyStore:
         return self._keystore
@@ -186,7 +216,12 @@ class Network:
         getSessionUrl = f"https://api.casambi.com/network/{self._id}/session"
 
         res = await self._httpClient.post(
-            getSessionUrl, json={"password": password, "deviceName": DEVICE_NAME}
+            getSessionUrl,
+            json={
+                "token": self._token,
+                "password": password,
+                "deviceName": DEVICE_NAME,
+            },
         )
         if res.status_code == httpx.codes.OK:
             # Parse session
@@ -232,7 +267,9 @@ class Network:
                     getNetworkUrl,
                     json={
                         "formatVersion": 1,
+                        "token": self._token,
                         "deviceName": DEVICE_NAME,
+                        "clientInfo": self._clientInfo,
                         "revision": self._networkRevision,
                     },
                     headers={"X-Casambi-Session": self._session.session},  # type: ignore[union-attr]
@@ -302,15 +339,23 @@ class Network:
 
             self._classicVisitorKey = _parse_hex_key(visitor_hex)
             self._classicManagerKey = _parse_hex_key(manager_hex)
-            self._logger.info(
-                "Classic keys present: visitor=%s manager=%s",
-                bool(self._classicVisitorKey),
-                bool(self._classicManagerKey),
-            )
+            if not (self._classicVisitorKey or self._classicManagerKey):
+                # Android still sends Classic frames even when keys are null (signature bytes remain zeros).
+                # We need this as a loud hint for testers when Classic control doesn't work yet.
+                self._logger.warning(
+                    "[CASAMBI_CLASSIC_KEYS_MISSING] visitorKey=false managerKey=false"
+                )
+            else:
+                self._logger.info(
+                    "Classic keys present: visitor=%s manager=%s",
+                    bool(self._classicVisitorKey),
+                    bool(self._classicManagerKey),
+                )
 
         # Parse units
         self.units = []
         units = network["network"]["units"]
+        units_with_security_key = 0
         for u in units:
             uType = await self._fetchUnitInfo(u["type"])
             if uType is None:
@@ -318,6 +363,23 @@ class Network:
                     "Failed to fetch type for unit %i. Skipping.", u["type"]
                 )
                 continue
+
+            security_key: bytes | None = None
+            sec_hex = u.get("securityKey")
+            if isinstance(sec_hex, str):
+                sec_hex = sec_hex.strip()
+                if sec_hex:
+                    try:
+                        security_key = bytes.fromhex(sec_hex)
+                    except ValueError:
+                        self._logger.debug(
+                            "Invalid unit securityKey hex for unit %s (len=%d).",
+                            u.get("deviceID"),
+                            len(sec_hex),
+                        )
+            if security_key is not None:
+                units_with_security_key += 1
+
             uObj = Unit(
                 u["type"],
                 u["deviceID"],
@@ -326,8 +388,23 @@ class Network:
                 u["name"],
                 str(u["firmware"]),
                 uType,
+                securityKey=security_key,
             )
             self.units.append(uObj)
+
+        # One compact profile line to help interpret mixed/legacy networks from tester logs.
+        # Keep EVO networks at INFO to avoid noisy HA warnings; elevate legacy (<10) to WARNING.
+        level = logging.WARNING if self._protocolVersion < 10 else logging.INFO
+        self._logger.log(
+            level,
+            "[CASAMBI_NETWORK_PROFILE] uuid=%s id=%s protocolVersion=%s units=%d units_with_securityKey=%d keyStore=%s",
+            self._uuid,
+            self._id,
+            self._protocolVersion,
+            len(self.units),
+            units_with_security_key,
+            "keyStore" in network["network"],
+        )
 
         # Parse cells
         self.groups = []
