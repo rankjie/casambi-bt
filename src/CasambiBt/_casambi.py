@@ -206,16 +206,33 @@ class Casambi:
 
         # Classic protocol uses signed command frames (u1.C1753e / u1.EnumC1754f).
         if self._casaClient is not None and self._casaClient.protocolMode == ProtocolMode.CLASSIC:
-            # EnumC1754f ordinals (ground truth: casambi-android u1.EnumC1754f):
-            # - AllUnitsLevel=4, UnitLevel=7, GroupLevel=26
-            if isinstance(target, Unit):
-                cmd = self._casaClient.buildClassicCommand(7, payload, target_id=target.deviceId)
-            elif isinstance(target, Group):
-                cmd = self._casaClient.buildClassicCommand(26, payload, target_id=target.groudId)
-            elif target is None:
-                cmd = self._casaClient.buildClassicCommand(4, payload)
+            # Check if we should use the alternative simple format from BLE captures
+            import os
+            use_simple = os.environ.get("CASAMBI_BT_CLASSIC_FORMAT", "").lower() == "simple"
+
+            if use_simple:
+                # Simple format: [counter][unit_id][param_len][dimmer]
+                # For "all units", use unit_id=0xFF
+                if isinstance(target, Unit):
+                    cmd = self._casaClient.buildClassicCommandSimple(target.deviceId, level)
+                elif isinstance(target, Group):
+                    # Groups in simple format: not fully confirmed, try group ID
+                    cmd = self._casaClient.buildClassicCommandSimple(target.groudId, level)
+                elif target is None:
+                    cmd = self._casaClient.buildClassicCommandSimple(0xFF, level)
+                else:
+                    raise TypeError(f"Unkown target type {type(target)}")
             else:
-                raise TypeError(f"Unkown target type {type(target)}")
+                # EnumC1754f ordinals (ground truth: casambi-android u1.EnumC1754f):
+                # - AllUnitsLevel=4, UnitLevel=7, GroupLevel=26
+                if isinstance(target, Unit):
+                    cmd = self._casaClient.buildClassicCommand(7, payload, target_id=target.deviceId)
+                elif isinstance(target, Group):
+                    cmd = self._casaClient.buildClassicCommand(26, payload, target_id=target.groudId)
+                elif target is None:
+                    cmd = self._casaClient.buildClassicCommand(4, payload)
+                else:
+                    raise TypeError(f"Unkown target type {type(target)}")
 
             await self._casaClient.send(cmd)
             return

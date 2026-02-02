@@ -163,6 +163,11 @@ class CasambiClient:
         self._classicRxKindSamples: dict[str, int] = {}
         self._classicRxLastStatsTs = time.monotonic()
 
+        # Classic diagnostic packet history (for dump_classic_diagnostics service)
+        self._classicTxHistory: list[dict[str, Any]] = []
+        self._classicRxHistory: list[dict[str, Any]] = []
+        self._classicDiagMaxHistory = 50  # Keep last 50 TX and RX packets
+
     @property
     def protocolMode(self) -> ProtocolMode | None:
         return self._protocolMode
@@ -1004,6 +1009,39 @@ class CasambiClient:
 
         return bytes(b)
 
+    def buildClassicCommandSimple(
+        self,
+        unit_id: int,
+        dimmer: int,
+        extra: int | None = None,
+    ) -> bytes:
+        """Build a Classic command using the simple format from BLE captures.
+
+        This alternative format was observed in real BLE captures and differs from
+        the Android u1.C1753e command record format. Use with env variable
+        CASAMBI_BT_CLASSIC_FORMAT=simple to experiment.
+
+        Format (before header added by _sendClassic):
+        [counter:1][unit_id:1][param_len:1][dimmer:1][extra:1?]
+
+        The header (added by _sendClassic) is:
+        - Conformant: [auth:1][cmac:4|16][seq:2]
+        - Legacy: [cmac:4]
+
+        Args:
+            unit_id: Target unit ID (0-255, use 0xFF for "all units")
+            dimmer: Dimmer/level value (0-255)
+            extra: Optional extra parameter (e.g., temperature/vertical value)
+
+        Returns:
+            Command bytes to pass to _sendClassic
+        """
+        counter = self._classic_next_div()
+        if extra is not None:
+            return bytes([counter, unit_id & 0xFF, 2, dimmer & 0xFF, extra & 0xFF])
+        else:
+            return bytes([counter, unit_id & 0xFF, 1, dimmer & 0xFF])
+
     async def _sendClassic(self, command_bytes: bytes) -> None:
         self._checkState(ConnectionState.AUTHENTICATED)
         if self._protocolMode != ProtocolMode.CLASSIC:
@@ -1143,7 +1181,46 @@ class CasambiClient:
 
         # Classic packets can exceed 20 bytes when using a 16-byte manager signature.
         # Bleak needs a write-with-response for long writes on most backends.
-        await self._gattClient.write_gatt_char(tx_uuid, bytes(pkt), response=True)
+        tx_result = "pending"
+        try:
+            await self._gattClient.write_gatt_char(tx_uuid, bytes(pkt), response=True)
+            tx_result = "ok"
+        except Exception as e:
+            tx_result = f"error: {type(e).__name__}: {e}"
+            raise
+        finally:
+            # Record TX in diagnostic history
+            tx_entry = {
+                "timestamp": time.monotonic(),
+                "header_mode": header_mode,
+                "key": key_name,
+                "signed": signed,
+                "tx_uuid": tx_uuid,
+                "auth_level": auth_level if header_mode == "conformant" else None,
+                "sig_len": sig_len,
+                "seq": seq,
+                "cmd_ordinal": cmd_ordinal,
+                "cmd_target": cmd_target,
+                "cmd_div": cmd_div,
+                "cmd_lifetime": cmd_lifetime,
+                "cmd_payload_len": cmd_payload_len,
+                "total_len": len(pkt),
+                "pre_sign_hex": b2a(command_bytes).decode("ascii"),
+                "post_sign_hex": b2a(bytes(pkt)).decode("ascii"),
+                "result": tx_result,
+            }
+            self._classicTxHistory.append(tx_entry)
+            if len(self._classicTxHistory) > self._classicDiagMaxHistory:
+                self._classicTxHistory = self._classicTxHistory[-self._classicDiagMaxHistory:]
+
+            # Enhanced TX diagnostic log
+            self._logger.warning(
+                "[CLASSIC_DIAG_TX_RESULT] result=%s header=%s seq=%s total_len=%d",
+                tx_result,
+                header_mode,
+                None if seq is None else f"0x{seq:04x}",
+                len(pkt),
+            )
 
     def _establishedNofityCallback(
         self, handle: BleakGATTCharacteristic, data: bytes
@@ -1231,10 +1308,26 @@ class CasambiClient:
         """
         self._inPacketCount += 1
         self._classicRxFrames += 1
+        rx_ts = time.monotonic()
         if self._classicFirstRxTs is None:
-            self._classicFirstRxTs = time.monotonic()
+            self._classicFirstRxTs = rx_ts
 
         raw = bytes(data)
+
+        # Enhanced RX diagnostic logging
+        try:
+            handle_uuid = str(getattr(handle, "uuid", "unknown")).lower()
+        except Exception:
+            handle_uuid = "unknown"
+
+        self._logger.warning(
+            "[CLASSIC_DIAG_RX] #%d handle=%s len=%d hex=%s",
+            self._classicRxFrames,
+            handle_uuid,
+            len(raw),
+            b2a(raw[: min(len(raw), 48)]).decode("ascii") + ("..." if len(raw) > 48 else ""),
+        )
+
         if self._logger.isEnabledFor(logging.DEBUG):
             self._logger.debug(
                 "[CASAMBI_CLASSIC_RX_RAW] len=%d hex=%s",
@@ -1423,6 +1516,36 @@ class CasambiClient:
             self._classicRxVerified += 1
         elif verified is None:
             self._classicRxUnverifiable += 1
+
+        # Record RX in diagnostic history
+        rx_entry = {
+            "timestamp": rx_ts,
+            "handle_uuid": handle_uuid,
+            "header_mode": best["mode"],
+            "verified": verified,
+            "auth_level": best["auth_level"],
+            "sig_len": best["sig_len"],
+            "seq": best["seq"],
+            "payload_len": len(payload),
+            "raw_hex": b2a(raw).decode("ascii"),
+            "payload_hex": b2a(payload).decode("ascii"),
+            "score": best["score"],
+        }
+        self._classicRxHistory.append(rx_entry)
+        if len(self._classicRxHistory) > self._classicDiagMaxHistory:
+            self._classicRxHistory = self._classicRxHistory[-self._classicDiagMaxHistory:]
+
+        # Enhanced RX parse result log
+        self._logger.warning(
+            "[CLASSIC_DIAG_RX_PARSE] mode=%s verified=%s auth=%s sig_len=%d seq=%s score=%d payload_len=%d",
+            best["mode"],
+            verified,
+            None if best["auth_level"] is None else f"0x{best['auth_level']:02x}",
+            best["sig_len"],
+            None if best["seq"] is None else f"0x{best['seq']:04x}",
+            best["score"],
+            len(payload),
+        )
 
         # Auto-correct header mode if the other format parses much better.
         if best["mode"] != preferred:
@@ -1865,3 +1988,39 @@ class CasambiClient:
 
         self._connectionState = ConnectionState.NONE
         self._logger.info("Disconnected.")
+
+    def getClassicDiagnostics(self) -> dict[str, Any]:
+        """Return Classic protocol diagnostic state for external services.
+
+        This method provides a snapshot of Classic protocol state including:
+        - Connection parameters (hash, mode, UUIDs)
+        - RX/TX statistics
+        - Last N TX and RX packets
+        - Any detected errors or anomalies
+
+        Safe to call from HA services for dump_classic_diagnostics.
+        """
+        return {
+            "protocol_mode": self._protocolMode.name if self._protocolMode else None,
+            "classic_header_mode": self._classicHeaderMode,
+            "classic_hash_source": self._classicHashSource,
+            "classic_conn_hash8_hex": b2a(self._classicConnHash8).decode("ascii") if self._classicConnHash8 else None,
+            "classic_tx_uuid": self._classicTxCharUuid,
+            "classic_notify_uuids": sorted(self._classicNotifyCharUuids) if self._classicNotifyCharUuids else [],
+            "classic_first_rx_ts": self._classicFirstRxTs,
+            "classic_rx_stats": {
+                "frames": self._classicRxFrames,
+                "verified": self._classicRxVerified,
+                "unverifiable": self._classicRxUnverifiable,
+                "parse_fail": self._classicRxParseFail,
+                "type6_unitstate": self._classicRxType6,
+                "type7_switch": self._classicRxType7,
+                "type9_netconf": self._classicRxType9,
+                "cmdstream": self._classicRxCmdStream,
+                "unknown": self._classicRxUnknown,
+            },
+            "classic_tx_count": len(self._classicTxHistory),
+            "classic_rx_count": len(self._classicRxHistory),
+            "classic_tx_history": self._classicTxHistory[-20:],  # Last 20
+            "classic_rx_history": self._classicRxHistory[-20:],  # Last 20
+        }
