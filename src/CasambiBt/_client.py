@@ -159,6 +159,7 @@ class CasambiClient:
         self._classicRxType9 = 0
         self._classicRxCmdStream = 0
         self._classicRxUnknown = 0
+        self._classicRxClassicStates = 0
         # Per-kind sample counters to ensure we emit at least a few examples for reverse engineering.
         self._classicRxKindSamples: dict[str, int] = {}
         self._classicRxLastStatsTs = time.monotonic()
@@ -1222,6 +1223,75 @@ class CasambiClient:
                 len(pkt),
             )
 
+    async def classicSendInit(self) -> None:
+        """Send Classic post-connection initialization (time-sync).
+
+        Ground truth: casambi-android AbstractC1717h.X() (lines 254-345).
+        The Android app sends this as the first packet after Classic connection.
+        In EVO, the key exchange/auth handshake implicitly signals the device;
+        Classic has no such handshake, so an explicit init write is needed to
+        trigger the device to start broadcasting state notifications.
+
+        The payload is sent raw via _sendClassic (NOT wrapped in buildClassicCommand).
+        """
+        self._checkState(ConnectionState.AUTHENTICATED)
+        if self._protocolMode != ProtocolMode.CLASSIC:
+            return
+
+        import datetime as _dt
+
+        now = _dt.datetime.now()
+
+        # Timezone offset in minutes from UTC.
+        local_tz = _dt.datetime.now(_dt.timezone.utc).astimezone().tzinfo
+        utc_offset_minutes = 0
+        if local_tz is not None:
+            offset = local_tz.utcoffset(now)
+            if offset is not None:
+                utc_offset_minutes = int(offset.total_seconds()) // 60
+
+        # Build the time-sync payload.
+        # Format: [10][year:2BE][month:1][day:1][hour:1][min:1][sec:1]
+        #         [tz_offset:2BE signed][dst_transition:4BE][dst_change:1]
+        #         [timestamp1:4BE][timestamp2:4BE][zero:2][millis:3BE]
+        payload = bytearray()
+        payload.append(10)  # Classic time-sync command byte
+        payload.extend(struct.pack(">H", now.year))
+        payload.append(now.month)
+        payload.append(now.day)
+        payload.append(now.hour)
+        payload.append(now.minute)
+        payload.append(now.second)
+        payload.extend(struct.pack(">h", utc_offset_minutes))
+        # DST transition data and change minutes (0 = no DST info).
+        payload.extend(struct.pack(">I", 0))
+        payload.append(0)
+        # Classic extra bytes: timestamps, zero short, millis.
+        # Start with zeros - refine after tester feedback if needed.
+        payload.extend(struct.pack(">I", 0))  # timestamp1
+        payload.extend(struct.pack(">I", 0))  # timestamp2
+        payload.extend(struct.pack(">H", 0))  # zero
+        # j() in Android is a 3-byte big-endian write.
+        millis_val = now.microsecond // 1000 * 1000
+        payload.append((millis_val >> 16) & 0xFF)
+        payload.append((millis_val >> 8) & 0xFF)
+        payload.append(millis_val & 0xFF)
+
+        self._logger.warning(
+            "[CASAMBI_CLASSIC_INIT] sending time-sync len=%d hex=%s",
+            len(payload),
+            b2a(bytes(payload)),
+        )
+
+        try:
+            await self._sendClassic(bytes(payload))
+            self._logger.warning("[CASAMBI_CLASSIC_INIT] time-sync sent successfully")
+        except Exception:
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_INIT] time-sync send failed",
+                exc_info=True,
+            )
+
     def _establishedNofityCallback(
         self, handle: BleakGATTCharacteristic, data: bytes
     ) -> None:
@@ -1579,7 +1649,7 @@ class CasambiClient:
             self._classicRxLastStatsTs = now
             self._logger.warning(
                 "[CASAMBI_CLASSIC_RX_STATS] frames=%d verified=%d unverifiable=%d parse_fail=%d header=%s "
-                "type6=%d type7=%d type9=%d cmdstream=%d unknown=%d",
+                "type6=%d type7=%d type9=%d cmdstream=%d unknown=%d classic_states=%d",
                 self._classicRxFrames,
                 self._classicRxVerified,
                 self._classicRxUnverifiable,
@@ -1590,7 +1660,16 @@ class CasambiClient:
                 self._classicRxType9,
                 self._classicRxCmdStream,
                 self._classicRxUnknown,
+                self._classicRxClassicStates,
             )
+
+        # Classic payloads use a completely different format from EVO.
+        # Classic: byte 0 is a type indicator (0=netconfig, 255=log, else=unit_id).
+        # EVO: byte 0 is a packet type (6=UnitState, 7=Switch, 9=NetConfig).
+        # Dispatch Classic through its own parser to avoid misinterpretation.
+        if self._protocolMode == ProtocolMode.CLASSIC:
+            self._dispatchClassicPayload(payload)
+            return
 
         # If the payload starts with a known EVO packet type, reuse existing parsers.
         packet_type = payload[0]
@@ -1700,6 +1779,146 @@ class CasambiClient:
                 "[CASAMBI_CLASSIC_CMD_TRAILING] len=%d hex=%s",
                 len(payload) - pos,
                 b2a(payload[pos:]),
+            )
+
+    def _dispatchClassicPayload(self, payload: bytes) -> None:
+        """Dispatch a verified Classic payload based on its type indicator.
+
+        Classic payloads (from C1751c.V()) use a different format from EVO:
+        - byte 0 == 0: network config data
+        - byte 0 == 255: log message
+        - otherwise: unit state stream (byte 0 is the first unit_id)
+        """
+        if not payload:
+            return
+
+        first_byte = payload[0]
+
+        # Log full payload for the first 10 Classic payloads regardless of type.
+        if self._classicRxClassicStates < 10:
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_DISPATCH] #%d type_byte=%d len=%d hex=%s",
+                self._classicRxClassicStates,
+                first_byte,
+                len(payload),
+                b2a(payload[: min(len(payload), 64)]).decode("ascii")
+                + ("..." if len(payload) > 64 else ""),
+            )
+
+        if first_byte == 0:
+            self._logger.debug("[CASAMBI_CLASSIC_NETCONFIG] len=%d", len(payload))
+            return
+
+        if first_byte == 255:
+            self._logger.debug("[CASAMBI_CLASSIC_LOG] len=%d", len(payload))
+            return
+
+        # Unit state stream: entire payload is passed (first byte is the first unit_id).
+        self._classicRxClassicStates += 1
+        self._parseClassicUnitStates(payload)
+
+    def _parseClassicUnitStates(self, data: bytes) -> None:
+        """Parse Classic unit state records.
+
+        Ground truth: casambi-android C1751c.V() (line 301+).
+        Format is completely different from EVO _parseUnitStates:
+        - flags lower nibble = state_len (EVO uses a separate byte)
+        - flags bit 5 = extra1 present, bit 6 = extra2 present, bit 7 = offline
+        - unit_id 0xF0 = command response (skip)
+        """
+        self._logger.debug("Parsing Classic unit states...")
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug("[CASAMBI_CLASSIC_STATES_RAW] len=%d hex=%s", len(data), b2a(data))
+
+        pos = 0
+        old_pos = 0
+        records_parsed = 0
+        try:
+            while pos + 2 <= len(data):
+                unit_id = data[pos]
+                flags = data[pos + 1]
+                pos += 2
+
+                state_len = flags & 0x0F
+                has_extra1 = (flags & 0x20) != 0
+                has_extra2 = (flags & 0x40) != 0
+                is_offline = (flags & 0x80) != 0
+
+                # 0xF0 = command response record, skip state_len bytes.
+                if unit_id == 0xF0:
+                    pos += state_len
+                    continue
+
+                extra1 = 0
+                if has_extra1:
+                    if pos >= len(data):
+                        break
+                    extra1 = data[pos]
+                    pos += 1
+
+                extra2 = 0
+                if has_extra2:
+                    if pos >= len(data):
+                        break
+                    extra2 = data[pos]
+                    pos += 1
+
+                if pos + state_len > len(data):
+                    break
+
+                state = data[pos : pos + state_len]
+                pos += state_len
+                records_parsed += 1
+
+                # Log the first few parsed records at WARNING level for tester visibility.
+                if records_parsed <= 10 or self._logger.isEnabledFor(logging.DEBUG):
+                    self._logger.warning(
+                        "[CASAMBI_CLASSIC_STATE_PARSED] unit=%d flags=0x%02x state_len=%d "
+                        "offline=%s extra1=%d extra2=%d state=%s",
+                        unit_id,
+                        flags,
+                        state_len,
+                        is_offline,
+                        extra1,
+                        extra2,
+                        b2a(state),
+                    )
+
+                online = not is_offline
+                # Let Unit.is_on derive actual on/off from state bytes (dimmer, onoff).
+                on = True
+
+                self._dataCallback(
+                    IncommingPacketType.UnitState,
+                    {
+                        "id": unit_id,
+                        "online": online,
+                        "on": on,
+                        "state": state,
+                        "flags": flags,
+                        "prio": 0,
+                        "state_len": state_len,
+                        "padding_len": 0,
+                        "con": None,
+                        "sid": None,
+                        "extra_byte": extra1,
+                        "extra_float": extra1 / 255.0 if extra1 else 0.0,
+                    },
+                )
+
+                old_pos = pos
+        except IndexError:
+            self._logger.error(
+                "Ran out of data while parsing Classic unit state! Remaining data %s in %s.",
+                b2a(data[old_pos:]),
+                b2a(data),
+            )
+
+        if records_parsed > 0:
+            self._logger.debug(
+                "[CASAMBI_CLASSIC_STATES_DONE] records=%d remaining=%d",
+                records_parsed,
+                len(data) - pos,
             )
 
     def _parseUnitStates(self, data: bytes) -> None:

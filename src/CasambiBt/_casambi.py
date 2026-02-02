@@ -169,10 +169,15 @@ class Casambi:
         self._casaClient = cast(CasambiClient, self._casaClient)
         await self._casaClient.connect()
         try:
-            # EVO requires key exchange + authenticate; Classic is ready after `connect()`.
             if self._casaClient.protocolMode == ProtocolMode.EVO:
+                # EVO requires key exchange + authenticate.
                 await self._casaClient.exchangeKey()
                 await self._casaClient.authenticate()
+            elif self._casaClient.protocolMode == ProtocolMode.CLASSIC:
+                # Classic needs an init write to trigger state broadcasts.
+                # In EVO the key exchange/auth handshake implicitly signals the
+                # device; Classic has no such handshake so we send a time-sync.
+                await self._casaClient.classicSendInit()
         except ProtocolError as e:
             await self._casaClient.disconnect()
             raise e
