@@ -438,6 +438,7 @@ class CasambiClient:
                     self._network.classicManagerKey() is not None,
                     getattr(self._network, "isManager", lambda: False)(),
                 )
+                await self._classicEnumerateAndSubscribeGatt(notify_kwargs)
                 _log_probe_summary("CLASSIC", classic_variant="ca52_legacy")
                 # Emit a warning if we never see Classic RX frames; this is a common failure mode.
                 self._classicNoRxTask = asyncio.create_task(self._classic_no_rx_watchdog(30.0))
@@ -593,6 +594,7 @@ class CasambiClient:
                 self._network.classicManagerKey() is not None,
                 getattr(self._network, "isManager", lambda: False)(),
             )
+            await self._classicEnumerateAndSubscribeGatt(notify_kwargs)
             _log_probe_summary("CLASSIC", classic_variant="auth_uuid_conformant")
             self._classicNoRxTask = asyncio.create_task(self._classic_no_rx_watchdog(30.0))
             return
@@ -1223,6 +1225,58 @@ class CasambiClient:
                 len(pkt),
             )
 
+    async def _classicEnumerateAndSubscribeGatt(
+        self, notify_kwargs: dict[str, Any]
+    ) -> None:
+        """Enumerate all GATT characteristics and subscribe to any notifiable ones.
+
+        This discovers characteristics beyond the manually-probed CA51/CA52/CA53
+        UUIDs and subscribes to any that support notify or indicate, which may be
+        needed for receiving Classic state/config notifications.
+        """
+        try:
+            total_chars = 0
+            for svc in self._gattClient.services:
+                for char in svc.characteristics:
+                    total_chars += 1
+                    char_uuid = str(char.uuid).lower()
+                    props = char.properties
+                    self._logger.warning(
+                        "[CASAMBI_CLASSIC_GATT_CHAR] uuid=%s props=%s handle=%d",
+                        char_uuid,
+                        props,
+                        char.handle,
+                    )
+                    if char_uuid not in self._classicNotifyCharUuids:
+                        if "notify" in props or "indicate" in props:
+                            try:
+                                await self._gattClient.start_notify(
+                                    char.uuid,
+                                    self._queueCallback,
+                                    **notify_kwargs,
+                                )
+                                self._classicNotifyCharUuids.add(char_uuid)
+                                self._logger.warning(
+                                    "[CASAMBI_CLASSIC_GATT_SUB] subscribed uuid=%s",
+                                    char_uuid,
+                                )
+                            except Exception as e:
+                                self._logger.warning(
+                                    "[CASAMBI_CLASSIC_GATT_SUB] failed uuid=%s err=%s",
+                                    char_uuid,
+                                    type(e).__name__,
+                                )
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_GATT_ENUM] total_chars=%d subscribed_uuids=%s",
+                total_chars,
+                sorted(self._classicNotifyCharUuids),
+            )
+        except Exception as e:
+            self._logger.warning(
+                "[CASAMBI_CLASSIC_GATT_ENUM] services enumeration unavailable: %s",
+                type(e).__name__,
+            )
+
     async def classicSendInit(self) -> None:
         """Send Classic post-connection initialization (time-sync).
 
@@ -1253,7 +1307,7 @@ class CasambiClient:
         # Build the time-sync payload.
         # Format: [10][year:2BE][month:1][day:1][hour:1][min:1][sec:1]
         #         [tz_offset:2BE signed][dst_transition:4BE][dst_change:1]
-        #         [timestamp1:4BE][timestamp2:4BE][zero:2][millis:3BE]
+        #         [timestamp1:3BE][timestamp2:3BE][zero:2][millis:3BE][extra:1]
         payload = bytearray()
         payload.append(10)  # Classic time-sync command byte
         payload.extend(struct.pack(">H", now.year))
@@ -1266,16 +1320,21 @@ class CasambiClient:
         # DST transition data and change minutes (0 = no DST info).
         payload.extend(struct.pack(">I", 0))
         payload.append(0)
-        # Classic extra bytes: timestamps, zero short, millis.
-        # Start with zeros - refine after tester feedback if needed.
-        payload.extend(struct.pack(">I", 0))  # timestamp1
-        payload.extend(struct.pack(">I", 0))  # timestamp2
-        payload.extend(struct.pack(">H", 0))  # zero
-        # j() in Android is a 3-byte big-endian write.
+        # Classic extra bytes: timestamps, zero short, millis, trailing byte.
+        # Android AbstractC1717h.X() lines 323-328: j() = 3-byte big-endian write
+        # (Q2.t.java:59-63), NOT 4-byte. Plus trailing writeByte(iK0 >> 24).
+        ts1 = 0  # Q2.r.K0(network.V) — start with 0
+        ts2 = 0  # Q2.r.K0(network.W) — start with 0
+        for ts in (ts1, ts2):
+            payload.append((ts >> 16) & 0xFF)
+            payload.append((ts >> 8) & 0xFF)
+            payload.append(ts & 0xFF)
+        payload.extend(struct.pack(">H", 0))  # writeShort(0)
         millis_val = now.microsecond // 1000 * 1000
         payload.append((millis_val >> 16) & 0xFF)
         payload.append((millis_val >> 8) & 0xFF)
         payload.append(millis_val & 0xFF)
+        payload.append((ts1 >> 24) & 0xFF)  # writeByte(iK0 >> 24)
 
         self._logger.warning(
             "[CASAMBI_CLASSIC_INIT] sending time-sync len=%d hex=%s",
