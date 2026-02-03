@@ -366,6 +366,24 @@ class CasambiClient:
                     f"Classic connection hash read failed/too short (len={0 if raw_hash is None else len(raw_hash)})."
                 )
             self._classicConnHash8 = bytes(raw_hash[:8])
+
+            # Parse Android's extended connection hash fields for diagnostics.
+            # Offset 8: unitId, 9: flags_lo, 10: MTU, 11: protocolVersion, 12: flags_hi
+            if len(raw_hash) >= 13:
+                ext_unit_id = raw_hash[8]
+                ext_flags_lo = raw_hash[9]
+                ext_mtu = raw_hash[10]
+                ext_proto_ver = raw_hash[11]
+                ext_flags_hi = raw_hash[12]
+                self._logger.warning(
+                    "[CASAMBI_CLASSIC_CONN_HASH_EXT] variant=legacy unitId=%d flags=0x%04x mtu=%d protocolVersion=%d raw=%s",
+                    ext_unit_id,
+                    (ext_flags_hi << 8) | ext_flags_lo,
+                    ext_mtu,
+                    ext_proto_ver,
+                    b2a(bytes(raw_hash[:min(len(raw_hash), 20)])),
+                )
+
             # Android seeds the command divider with a random byte on startup (u1.C1751c).
             self._classicCmdDiv = int.from_bytes(os.urandom(1), "big") or 1
             self._classicTxSeq = 0
@@ -516,6 +534,24 @@ class CasambiClient:
             self._classicHeaderMode = "conformant"
             self._classicHashSource = "ca52_0001"
             self._classicConnHash8 = bytes(first[:8])
+
+            # Parse Android's extended connection hash fields for diagnostics.
+            # Offset 8: unitId, 9: flags_lo, 10: MTU, 11: protocolVersion, 12: flags_hi
+            if len(first) >= 13:
+                ext_unit_id = first[8]
+                ext_flags_lo = first[9]
+                ext_mtu = first[10]
+                ext_proto_ver = first[11]
+                ext_flags_hi = first[12]
+                self._logger.warning(
+                    "[CASAMBI_CLASSIC_CONN_HASH_EXT] variant=conformant unitId=%d flags=0x%04x mtu=%d protocolVersion=%d raw=%s",
+                    ext_unit_id,
+                    (ext_flags_hi << 8) | ext_flags_lo,
+                    ext_mtu,
+                    ext_proto_ver,
+                    b2a(bytes(first[:min(len(first), 20)])),
+                )
+
             self._classicCmdDiv = int.from_bytes(os.urandom(1), "big") or 1
             self._classicTxSeq = 0
 
@@ -1045,11 +1081,11 @@ class CasambiClient:
         else:
             return bytes([counter, unit_id & 0xFF, 1, dimmer & 0xFF])
 
-    async def _sendClassic(self, command_bytes: bytes) -> None:
+    async def _sendClassic(self, command_bytes: bytes, *, target_uuid: str | None = None) -> None:
         self._checkState(ConnectionState.AUTHENTICATED)
         if self._protocolMode != ProtocolMode.CLASSIC:
             raise ProtocolError("Classic send called while not in Classic protocol mode.")
-        tx_uuid = self._classicTxCharUuid or self._dataCharUuid
+        tx_uuid = target_uuid or self._classicTxCharUuid or self._dataCharUuid
         if not tx_uuid:
             raise ProtocolError("Classic TX characteristic UUID not set.")
         if self._classicConnHash8 is None:
@@ -1304,12 +1340,22 @@ class CasambiClient:
             if offset is not None:
                 utc_offset_minutes = int(offset.total_seconds()) // 60
 
+        # Determine time-sync target and command byte per Android AbstractC1717h.X():
+        # - Non-conformant: write to CA51, command byte 10
+        # - Conformant: write to 0002 (mapped CA51), command byte 7
+        if self._classicHeaderMode == "conformant":
+            timesync_uuid = CASA_CLASSIC_CONFORMANT_CA51_CHAR_UUID  # 0002
+            timesync_cmd = 7
+        else:
+            timesync_uuid = CASA_CLASSIC_HASH_CHAR_UUID  # CA51
+            timesync_cmd = 10
+
         # Build the time-sync payload.
-        # Format: [10][year:2BE][month:1][day:1][hour:1][min:1][sec:1]
+        # Format: [cmd][year:2BE][month:1][day:1][hour:1][min:1][sec:1]
         #         [tz_offset:2BE signed][dst_transition:4BE][dst_change:1]
         #         [timestamp1:3BE][timestamp2:3BE][zero:2][millis:3BE][extra:1]
         payload = bytearray()
-        payload.append(10)  # Classic time-sync command byte
+        payload.append(timesync_cmd)
         payload.extend(struct.pack(">H", now.year))
         payload.append(now.month)
         payload.append(now.day)
@@ -1337,13 +1383,16 @@ class CasambiClient:
         payload.append((ts1 >> 24) & 0xFF)  # writeByte(iK0 >> 24)
 
         self._logger.warning(
-            "[CASAMBI_CLASSIC_INIT] sending time-sync len=%d hex=%s",
+            "[CASAMBI_CLASSIC_INIT] sending time-sync len=%d cmd=%d target_uuid=%s header_mode=%s hex=%s",
             len(payload),
+            timesync_cmd,
+            timesync_uuid,
+            self._classicHeaderMode,
             b2a(bytes(payload)),
         )
 
         try:
-            await self._sendClassic(bytes(payload))
+            await self._sendClassic(bytes(payload), target_uuid=timesync_uuid)
             self._logger.warning("[CASAMBI_CLASSIC_INIT] time-sync sent successfully")
         except Exception:
             self._logger.warning(
