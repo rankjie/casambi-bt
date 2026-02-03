@@ -9,7 +9,7 @@ from binascii import b2a_hex as b2a
 from collections.abc import Callable
 from enum import Enum, IntEnum, auto, unique
 from hashlib import sha256
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -800,6 +800,11 @@ class CasambiClient:
                 await self._activityLock.acquire()
                 try:
                     self._callbackMulitplexer(handle, data)
+                except Exception:
+                    self._logger.warning(
+                        "[CASAMBI_CALLBACK_ERROR] unhandled exception in callback multiplexer",
+                        exc_info=True,
+                    )
                 finally:
                     self._callbackQueue.task_done()
                     self._activityLock.release()
@@ -811,6 +816,10 @@ class CasambiClient:
     def _callbackMulitplexer(
         self, handle: BleakGATTCharacteristic, data: bytes
     ) -> None:
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
+                "[CASAMBI_MUX] state=%s len=%d", self._connectionState, len(data)
+            )
         if self._connectionState == ConnectionState.CONNECTED:
             self._exchNofityCallback(handle, data)
         elif self._connectionState == ConnectionState.KEY_EXCHANGED:
@@ -1081,7 +1090,14 @@ class CasambiClient:
         else:
             return bytes([counter, unit_id & 0xFF, 1, dimmer & 0xFF])
 
-    async def _sendClassic(self, command_bytes: bytes, *, target_uuid: str | None = None) -> None:
+    async def _sendClassic(
+        self,
+        command_bytes: bytes,
+        *,
+        target_uuid: str | None = None,
+        key_preference: Literal["auto", "visitor", "manager"] = "auto",
+        response: bool | None = None,
+    ) -> None:
         self._checkState(ConnectionState.AUTHENTICATED)
         if self._protocolMode != ProtocolMode.CLASSIC:
             raise ProtocolError("Classic send called while not in Classic protocol mode.")
@@ -1122,26 +1138,41 @@ class CasambiClient:
             # If parsing fails, keep fields as None.
             pass
 
-        # Key selection mirrors Android's intent:
-        # - Use manager key if our cloud session is manager and a managerKey exists.
-        # - Else use visitor key if present.
-        # - Else fall back to manager key if present.
-        # - Else send an unsigned frame (signature bytes remain zeros), which Android does when keys are null.
+        # Classic key selection:
+        #
+        # Android (v3.16) explicitly uses "visitor" signing (auth_level=2 / 4-byte sig)
+        # for the Classic enable-notify bootstrap packets (sendVersion + sendTime), even
+        # when a managerKey exists.
+        #
+        # For normal commands we keep the historical behavior ("auto" == prefer manager
+        # when the cloud session is manager), but allow overrides so init can match Android.
         key_name = "none"
-        auth_level = 0x02  # visitor by default
-        key = None
-        if manager_key is not None and getattr(self._network, "isManager", lambda: False)():
-            key_name = "manager"
-            auth_level = 0x03
-            key = manager_key
-        elif visitor_key is not None:
-            key_name = "visitor"
-            auth_level = 0x02
-            key = visitor_key
-        elif manager_key is not None:
-            key_name = "manager"
-            auth_level = 0x03
-            key = manager_key
+        auth_level = 0x02
+        key: bytes | None = None
+
+        if key_preference == "visitor":
+            if visitor_key is not None:
+                key_name, auth_level, key = "visitor", 0x02, visitor_key
+            elif manager_key is not None:
+                # Fallback: some networks have managerKey only.
+                key_name, auth_level, key = "manager", 0x03, manager_key
+            else:
+                key_name, auth_level, key = "none", 0x02, None
+        elif key_preference == "manager":
+            if manager_key is not None:
+                key_name, auth_level, key = "manager", 0x03, manager_key
+            elif visitor_key is not None:
+                key_name, auth_level, key = "visitor", 0x02, visitor_key
+            else:
+                key_name, auth_level, key = "none", 0x03, None
+        else:
+            # "auto" (legacy behavior)
+            if manager_key is not None and getattr(self._network, "isManager", lambda: False)():
+                key_name, auth_level, key = "manager", 0x03, manager_key
+            elif visitor_key is not None:
+                key_name, auth_level, key = "visitor", 0x02, visitor_key
+            elif manager_key is not None:
+                key_name, auth_level, key = "manager", 0x03, manager_key
 
         header_mode = self._classicHeaderMode or "conformant"
 
@@ -1218,11 +1249,14 @@ class CasambiClient:
                 b2a(bytes(pkt[: min(len(pkt), 24)])),
             )
 
-        # Classic packets can exceed 20 bytes when using a 16-byte manager signature.
-        # Bleak needs a write-with-response for long writes on most backends.
+        # Android uses WRITE_TYPE_NO_RESPONSE (1) for version/state writes (n0 path)
+        # and WRITE_TYPE_DEFAULT (2) = with-response for time-sync (X path).
+        # If caller didn't specify, default to True for backward compatibility
+        # (also needed for long writes with 16-byte manager signature).
+        use_response = response if response is not None else True
         tx_result = "pending"
         try:
-            await self._gattClient.write_gatt_char(tx_uuid, bytes(pkt), response=True)
+            await self._gattClient.write_gatt_char(tx_uuid, bytes(pkt), response=use_response)
             tx_result = "ok"
         except Exception as e:
             tx_result = f"error: {type(e).__name__}: {e}"
@@ -1314,19 +1348,50 @@ class CasambiClient:
             )
 
     async def classicSendInit(self) -> None:
-        """Send Classic post-connection initialization (time-sync).
+        """Send Classic post-connection initialization (version + time-sync).
 
-        Ground truth: casambi-android AbstractC1717h.X() (lines 254-345).
-        The Android app sends this as the first packet after Classic connection.
-        In EVO, the key exchange/auth handshake implicitly signals the device;
-        Classic has no such handshake, so an explicit init write is needed to
-        trigger the device to start broadcasting state notifications.
+        Ground truth (casambi-android v3.16):
+        - Enable notify on CA52/0001 (CCCD) (handled by Bleak start_notify)
+        - Send "version" on CA52/0001: bytes [0,1,11]
+          (`Z0/AbstractC0151u.h0()` in Android)
+        - Then send time-sync on CA51/0002 (cmd 10 legacy / 7 conformant)
+          (`Z0/AbstractC0142k.X()` in Android)
+
+        Classic often stays silent until this bootstrap is completed, so we do it
+        right after the BLE connection is established.
 
         The payload is sent raw via _sendClassic (NOT wrapped in buildClassicCommand).
         """
         self._checkState(ConnectionState.AUTHENTICATED)
         if self._protocolMode != ProtocolMode.CLASSIC:
             return
+
+        # Ensure notify setup has a moment to settle (Android delays ~100ms after CCCD write).
+        await asyncio.sleep(0.1)
+
+        # 1) Send Classic "version" packet on CA52/0001.
+        version_uuid = self._classicTxCharUuid or self._dataCharUuid
+        if version_uuid:
+            try:
+                self._logger.warning(
+                    "[CASAMBI_CLASSIC_INIT] sending version len=3 target_uuid=%s header_mode=%s",
+                    version_uuid,
+                    self._classicHeaderMode,
+                )
+                await self._sendClassic(
+                    b"\x00\x01\x0b",
+                    target_uuid=version_uuid,
+                    # Android uses visitor auth for this bootstrap packet.
+                    key_preference="visitor",
+                    # Android n0():998 uses WRITE_TYPE_NO_RESPONSE for classic.
+                    response=False,
+                )
+                self._logger.warning("[CASAMBI_CLASSIC_INIT] version sent successfully")
+            except Exception:
+                self._logger.warning(
+                    "[CASAMBI_CLASSIC_INIT] version send failed (continuing with time-sync)",
+                    exc_info=True,
+                )
 
         import datetime as _dt
 
@@ -1366,21 +1431,42 @@ class CasambiClient:
         # DST transition data and change minutes (0 = no DST info).
         payload.extend(struct.pack(">I", 0))
         payload.append(0)
-        # Classic extra bytes: timestamps, zero short, millis, trailing byte.
+        # Classic extra bytes: lon/lat (fixed-point), zero short, millis, trailing lon high byte.
         # Android AbstractC1717h.X() lines 323-328: j() = 3-byte big-endian write
         # (Q2.t.java:59-63), NOT 4-byte. Plus trailing writeByte(iK0 >> 24).
-        ts1 = 0  # Q2.r.K0(network.V) — start with 0
-        ts2 = 0  # Q2.r.K0(network.W) — start with 0
-        for ts in (ts1, ts2):
-            payload.append((ts >> 16) & 0xFF)
-            payload.append((ts >> 8) & 0xFF)
-            payload.append(ts & 0xFF)
+        #
+        # In casambi-android v3.16 these values are derived from:
+        # - longitude: round(longitude * 65536)
+        # - latitude:  round(latitude  * 65536)
+        # and sent as:
+        #   j(lon32) + j(lat32) + ... + writeByte(lon32 >> 24)
+        lon_fp32 = 0
+        lat_fp32 = 0
+        try:
+            raw = getattr(self._network, "rawNetworkData", None)
+            net = raw.get("network") if isinstance(raw, dict) else None
+            if isinstance(net, dict):
+                lon = net.get("longitude")
+                lat = net.get("latitude")
+                if isinstance(lon, (int, float, str)):
+                    lon_fp32 = int(round(float(lon) * 65536.0))
+                if isinstance(lat, (int, float, str)):
+                    lat_fp32 = int(round(float(lat) * 65536.0))
+        except Exception:
+            # Never fail init due to missing location; send zeros.
+            lon_fp32 = 0
+            lat_fp32 = 0
+
+        for v in (lon_fp32, lat_fp32):
+            payload.append((v >> 16) & 0xFF)
+            payload.append((v >> 8) & 0xFF)
+            payload.append(v & 0xFF)
         payload.extend(struct.pack(">H", 0))  # writeShort(0)
         millis_val = now.microsecond // 1000 * 1000
         payload.append((millis_val >> 16) & 0xFF)
         payload.append((millis_val >> 8) & 0xFF)
         payload.append(millis_val & 0xFF)
-        payload.append((ts1 >> 24) & 0xFF)  # writeByte(iK0 >> 24)
+        payload.append((lon_fp32 >> 24) & 0xFF)  # writeByte(lon >> 24)
 
         self._logger.warning(
             "[CASAMBI_CLASSIC_INIT] sending time-sync len=%d cmd=%d target_uuid=%s header_mode=%s hex=%s",
@@ -1392,7 +1478,14 @@ class CasambiClient:
         )
 
         try:
-            await self._sendClassic(bytes(payload), target_uuid=timesync_uuid)
+            await self._sendClassic(
+                bytes(payload),
+                target_uuid=timesync_uuid,
+                # Android uses visitor auth for this bootstrap packet.
+                key_preference="visitor",
+                # Android X():314 uses WRITE_TYPE_DEFAULT (2) = with-response.
+                response=True,
+            )
             self._logger.warning("[CASAMBI_CLASSIC_INIT] time-sync sent successfully")
         except Exception:
             self._logger.warning(
@@ -1410,9 +1503,19 @@ class CasambiClient:
         except Exception:
             handle_uuid = ""
         if handle_uuid and handle_uuid in self._classicNotifyCharUuids:
+            self._logger.debug(
+                "[CASAMBI_NOTIFY_ROUTE] classic_by_uuid uuid=%s len=%d",
+                handle_uuid,
+                len(data),
+            )
             self._classicEstablishedNotifyCallback(handle, data)
             return
         if self._protocolMode == ProtocolMode.CLASSIC:
+            self._logger.debug(
+                "[CASAMBI_NOTIFY_ROUTE] classic_by_mode uuid=%s len=%d",
+                handle_uuid,
+                len(data),
+            )
             self._classicEstablishedNotifyCallback(handle, data)
             return
 
@@ -1632,6 +1735,25 @@ class CasambiClient:
                 "payload": payload,
             }
 
+        def _parse_raw(raw_bytes: bytes) -> dict[str, Any] | None:
+            """Parse as raw (unsigned) Classic data.
+
+            Android classic gateway a1.c.V() receives raw bytes with NO CMAC
+            header — byte 0 is the unit_id directly. Adding this as a candidate
+            avoids silently dropping unsigned notifications.
+            """
+            if not raw_bytes:
+                return None
+            return {
+                "mode": "raw",
+                "auth_level": None,
+                "sig_len": 0,
+                "seq": None,
+                "key_name": None,
+                "verified": None,  # raw = unverifiable
+                "payload": raw_bytes,
+            }
+
         # Try the currently selected header mode first, then fall back.
         # Some mixed/legacy setups differ between CA52 (legacy) and auth-UUID (conformant).
         parsed_candidates: list[dict[str, Any]] = []
@@ -1652,6 +1774,12 @@ class CasambiClient:
                 r = _parse_legacy(raw, sig_len=sl)
                 if r is not None:
                     parsed_candidates.append(r)
+
+        # Add a raw (unsigned) candidate — needed because Android classic
+        # gateway receives raw bytes with no CMAC header.
+        raw_candidate = _parse_raw(raw)
+        if raw_candidate is not None:
+            parsed_candidates.append(raw_candidate)
 
         if not parsed_candidates:
             self._classicRxParseFail += 1
@@ -1726,7 +1854,8 @@ class CasambiClient:
         )
 
         # Auto-correct header mode if the other format parses much better.
-        if best["mode"] != preferred:
+        # Never switch to "raw" — raw is not a header mode, only a fallback parse.
+        if best["mode"] != preferred and best["mode"] in ("conformant", "legacy"):
             # Only switch if we got a stronger signal (verified or plausible payload with fewer assumptions).
             if best["score"] >= 50 and self._logLimiter.allow("classic_rx_mode_switch", burst=3, window_s=3600.0):
                 self._logger.warning(
@@ -1928,11 +2057,11 @@ class CasambiClient:
     def _parseClassicUnitStates(self, data: bytes) -> None:
         """Parse Classic unit state records.
 
-        Ground truth: casambi-android C1751c.V() (line 301+).
+        Ground truth: casambi-android a1.c.V() (line 226+).
         Format is completely different from EVO _parseUnitStates:
         - flags lower nibble = state_len (EVO uses a separate byte)
-        - flags bit 5 = extra1 present, bit 6 = extra2 present, bit 7 = offline
-        - unit_id 0xF0 = command response (skip)
+        - flags bit 4 = priority 14, bit 5 = extra1, bit 6 = extra2, bit 7 = online
+        - unit_id 0xF0 = command response (cmd_id + seq + payload)
         """
         self._logger.debug("Parsing Classic unit states...")
         if self._logger.isEnabledFor(logging.DEBUG):
@@ -1942,7 +2071,8 @@ class CasambiClient:
         old_pos = 0
         records_parsed = 0
         try:
-            while pos + 2 <= len(data):
+            # Android uses fVar.available() >= 3 as loop guard.
+            while pos + 3 <= len(data):
                 unit_id = data[pos]
                 flags = data[pos + 1]
                 pos += 2
@@ -1950,10 +2080,21 @@ class CasambiClient:
                 state_len = flags & 0x0F
                 has_extra1 = (flags & 0x20) != 0
                 has_extra2 = (flags & 0x40) != 0
-                is_offline = (flags & 0x80) != 0
+                # Android a1.c.java:286: (b6 & 128) != 0 → online (NOT offline).
+                # Confirmed by N1.java:1298 log "Set unit ONLINE=" + z6.
+                online = (flags & 0x80) != 0
 
-                # 0xF0 = command response record, skip state_len bytes.
+                # 0xF0 = command response record (Android a1.c.java:260-270).
+                # Format: cmd_id(1) + seq(1) + payload(state_len - 2).
                 if unit_id == 0xF0:
+                    cmd_id = data[pos] if pos < len(data) else None
+                    seq_byte = data[pos + 1] if pos + 1 < len(data) else None
+                    self._logger.debug(
+                        "[CASAMBI_CLASSIC_CMD_RESP] cmd_id=%s seq=%s state_len=%d",
+                        cmd_id,
+                        seq_byte,
+                        state_len,
+                    )
                     pos += state_len
                     continue
 
@@ -1982,17 +2123,15 @@ class CasambiClient:
                 if records_parsed <= 10 or self._logger.isEnabledFor(logging.DEBUG):
                     self._logger.warning(
                         "[CASAMBI_CLASSIC_STATE_PARSED] unit=%d flags=0x%02x state_len=%d "
-                        "offline=%s extra1=%d extra2=%d state=%s",
+                        "online=%s extra1=%d extra2=%d state=%s",
                         unit_id,
                         flags,
                         state_len,
-                        is_offline,
+                        online,
                         extra1,
                         extra2,
                         b2a(state),
                     )
-
-                online = not is_offline
                 # Let Unit.is_on derive actual on/off from state bytes (dimmer, onoff).
                 on = True
 
@@ -2004,7 +2143,8 @@ class CasambiClient:
                         "on": on,
                         "state": state,
                         "flags": flags,
-                        "prio": 0,
+                        # Android a1.c.java:291: (b6 & 16) != 0 ? 14 : 0
+                        "prio": 14 if (flags & 0x10) else 0,
                         "state_len": state_len,
                         "padding_len": 0,
                         "con": None,
