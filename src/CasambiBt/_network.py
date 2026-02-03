@@ -1,7 +1,7 @@
 import json
 import logging
-import platform
 import pickle
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Final, cast
@@ -13,7 +13,6 @@ from ._cache import Cache
 from ._constants import DEVICE_NAME
 from ._keystore import KeyStore
 from ._unit import Group, Scene, Unit, UnitControl, UnitControlType, UnitType
-from ._version import __version__
 from .errors import (
     AuthenticationError,
     NetworkNotFoundError,
@@ -66,29 +65,49 @@ class Network:
 
         self._cache = cache
 
-        # Android always includes a "token" (and typically "clientInfo") in cloud requests.
-        # We keep these stable for the process lifetime to make tester logs comparable.
-        self._token: str = self._make_token()
-        self._clientInfo: dict[str, Any] = self._make_client_info()
-
-    @staticmethod
-    def _make_token() -> str:
-        # Ground truth: casambi-android `w1.o.p(...)` sends `token` for session requests.
-        #
-        # Keep this structured (Android uses "brand/model/device/cpu/unknown") but avoid hostnames/PII.
-        sys = platform.system().lower() or "unknown"
-        machine = platform.machine().lower() or "unknown"
-        return f"python/{sys}/{machine}/unknown/unknown"
-
-    @staticmethod
-    def _make_client_info() -> dict[str, Any]:
-        # Ground truth: casambi-android `w1.o.g(...)` includes `clientInfo`.
-        return {
-            "name": "casambi-bt-revamped",
-            "version": __version__,
-            "python": platform.python_version(),
-            "platform": platform.platform(),
-        }
+        # Android sends "fb:<FCM_token>" — we have no push token, use empty string
+        # to match the field type without leaking platform info.
+        self._token: str = ""
+        # Android: "{flavor}/{version} {manufacturer}_{model}/{os_release}"
+        _app_version = random.choice((
+            "3.19.0", "3.18.2", "3.18.1", "3.18.0",
+            "3.17.4", "3.17.3", "3.17.2", "3.17.1", "3.17.0",
+            "3.16.5", "3.16.4", "3.16.3", "3.16.1", "3.16.0",
+            "3.15.3", "3.15.2", "3.15.1", "3.15.0",
+            "3.14.2", "3.14.1", "3.14.0",
+            "3.13.2", "3.13.1", "3.13.0",
+            "3.12.4", "3.12.3", "3.12.1", "3.12.0",
+            "3.11.2", "3.11.1",
+        ))
+        _device = random.choice((
+            # Samsung Galaxy S series
+            "samsung_SM-S928B/15",   # S24 Ultra
+            "samsung_SM-S926B/15",   # S24+
+            "samsung_SM-S921B/15",   # S24
+            "samsung_SM-S918B/14",   # S23 Ultra
+            "samsung_SM-S916B/14",   # S23+
+            "samsung_SM-S911B/14",   # S23
+            "samsung_SM-S908B/14",   # S22 Ultra
+            "samsung_SM-S906B/14",   # S22+
+            "samsung_SM-S901B/14",   # S22
+            "samsung_SM-G998B/13",   # S21 Ultra
+            "samsung_SM-G996B/13",   # S21+
+            "samsung_SM-G991B/13",   # S21
+            # Samsung Galaxy A series
+            "samsung_SM-A556B/14",   # A55
+            "samsung_SM-A546B/14",   # A54
+            "samsung_SM-A346B/14",   # A34
+            "samsung_SM-A536B/13",   # A53
+            # Google Pixel
+            "Google_Pixel 8 Pro/14",
+            "Google_Pixel 8/14",
+            "Google_Pixel 7 Pro/14",
+            "Google_Pixel 7/14",
+            # OnePlus
+            "OnePlus_IN2023/14",     # 12
+            "OnePlus_CPH2449/14",    # 11
+        ))
+        self._clientInfo: str = f"Casambi/{_app_version} {_device}"
 
     async def load(self) -> None:
         self._keystore = KeyStore(self._cache)
