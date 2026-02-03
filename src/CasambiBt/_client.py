@@ -1386,7 +1386,7 @@ class CasambiClient:
                     # Android n0():998 uses WRITE_TYPE_NO_RESPONSE for classic.
                     response=False,
                 )
-                self._logger.warning("[CASAMBI_CLASSIC_INIT] version sent successfully")
+                self._logger.debug("[CASAMBI_CLASSIC_INIT] version sent successfully")
             except Exception:
                 self._logger.warning(
                     "[CASAMBI_CLASSIC_INIT] version send failed (continuing with time-sync)",
@@ -1486,7 +1486,7 @@ class CasambiClient:
                 # Android X():314 uses WRITE_TYPE_DEFAULT (2) = with-response.
                 response=True,
             )
-            self._logger.warning("[CASAMBI_CLASSIC_INIT] time-sync sent successfully")
+            self._logger.debug("[CASAMBI_CLASSIC_INIT] time-sync sent successfully")
         except Exception:
             self._logger.warning(
                 "[CASAMBI_CLASSIC_INIT] time-sync send failed",
@@ -1601,7 +1601,7 @@ class CasambiClient:
         except Exception:
             handle_uuid = "unknown"
 
-        self._logger.warning(
+        self._logger.debug(
             "[CLASSIC_DIAG_RX] #%d handle=%s len=%d hex=%s",
             self._classicRxFrames,
             handle_uuid,
@@ -1618,7 +1618,7 @@ class CasambiClient:
 
         if self._classicConnHash8 is None:
             if self._logLimiter.allow("classic_rx_no_hash", burst=5, window_s=60.0):
-                self._logger.warning("[CASAMBI_CLASSIC_RX] missing_connection_hash len=%d", len(raw))
+                self._logger.debug("[CASAMBI_CLASSIC_RX] missing_connection_hash len=%d", len(raw))
             return
 
         visitor_key = self._network.classicVisitorKey()
@@ -1823,7 +1823,7 @@ class CasambiClient:
         if not parsed_candidates:
             self._classicRxParseFail += 1
             if self._logLimiter.allow("classic_rx_parse_fail", burst=5, window_s=60.0):
-                self._logger.warning(
+                self._logger.debug(
                     "[CASAMBI_CLASSIC_RX_PARSE_FAIL] len=%d prefix=%s",
                     len(raw),
                     b2a(raw[: min(len(raw), 32)]),
@@ -1847,7 +1847,7 @@ class CasambiClient:
         if best["score"] == 0:
             self._classicRxParseFail += 1
             if self._logLimiter.allow("classic_rx_unplausible", burst=5, window_s=60.0):
-                self._logger.warning(
+                self._logger.debug(
                     "[CASAMBI_CLASSIC_RX_UNPLAUSIBLE] preferred=%s len=%d prefix=%s",
                     preferred,
                     len(raw),
@@ -1881,7 +1881,7 @@ class CasambiClient:
             self._classicRxHistory = self._classicRxHistory[-self._classicDiagMaxHistory:]
 
         # Enhanced RX parse result log
-        self._logger.warning(
+        self._logger.debug(
             "[CLASSIC_DIAG_RX_PARSE] mode=%s verified=%s auth=%s sig_len=%d seq=%s score=%d payload_len=%d",
             best["mode"],
             verified,
@@ -1897,7 +1897,7 @@ class CasambiClient:
         if best["mode"] != preferred and best["mode"] in ("conformant", "legacy"):
             # Only switch if we got a stronger signal (verified or plausible payload with fewer assumptions).
             if best["score"] >= 50 and self._logLimiter.allow("classic_rx_mode_switch", burst=3, window_s=3600.0):
-                self._logger.warning(
+                self._logger.debug(
                     "[CASAMBI_CLASSIC_RX_MODE] switching %s -> %s (score=%d verified=%s sig_len=%d)",
                     preferred,
                     best["mode"],
@@ -1909,7 +1909,7 @@ class CasambiClient:
 
         # Sample RX logs (limited) + periodic stats (limited).
         if self._logLimiter.allow("classic_rx_sample", burst=10, window_s=60.0):
-            self._logger.warning(
+            self._logger.debug(
                 "[CASAMBI_CLASSIC_RX] header=%s verified=%s auth=%s sig_len=%d seq=%s payload_prefix=%s",
                 best["mode"],
                 verified,
@@ -1923,7 +1923,7 @@ class CasambiClient:
             "classic_rx_stats", burst=2, window_s=60.0
         ):
             self._classicRxLastStatsTs = now
-            self._logger.warning(
+            self._logger.debug(
                 "[CASAMBI_CLASSIC_RX_STATS] frames=%d verified=%d unverifiable=%d parse_fail=%d header=%s "
                 "type6=%d type7=%d type9=%d cmdstream=%d unknown=%d classic_states=%d",
                 self._classicRxFrames,
@@ -2039,7 +2039,7 @@ class CasambiClient:
 
         if self._classicRxKindSamples.get(kind, 0) < 3:
             self._classicRxKindSamples[kind] = self._classicRxKindSamples.get(kind, 0) + 1
-            self._logger.warning(
+            self._logger.debug(
                 "[CASAMBI_CLASSIC_RX_KIND] kind=%s header=%s verified=%s sig_len=%d seq=%s payload_prefix=%s",
                 kind,
                 best["mode"],
@@ -2072,7 +2072,7 @@ class CasambiClient:
 
         # Log full payload for the first 10 Classic payloads regardless of type.
         if self._classicRxClassicStates < 10:
-            self._logger.warning(
+            self._logger.debug(
                 "[CASAMBI_CLASSIC_DISPATCH] #%d type_byte=%d len=%d hex=%s",
                 self._classicRxClassicStates,
                 first_byte,
@@ -2160,7 +2160,7 @@ class CasambiClient:
 
                 # Log the first few parsed records at WARNING level for tester visibility.
                 if records_parsed <= 10 or self._logger.isEnabledFor(logging.DEBUG):
-                    self._logger.warning(
+                    self._logger.debug(
                         "[CASAMBI_CLASSIC_STATE_PARSED] unit=%d flags=0x%02x state_len=%d "
                         "online=%s extra1=%d extra2=%d state=%s",
                         unit_id,
