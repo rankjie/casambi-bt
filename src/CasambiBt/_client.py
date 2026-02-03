@@ -1624,6 +1624,39 @@ class CasambiClient:
         visitor_key = self._network.classicVisitorKey()
         manager_key = self._network.classicManagerKey()
 
+        def _walk_classic_records(data: bytes) -> bool:
+            """Check if data is a plausible Classic unit state record stream.
+
+            Walks the same record structure as _parseClassicUnitStates:
+            - unit_id(1) + flags(1) + optional extras + state(state_len)
+            - unit_id 0xF0 is a command response (no extras, state_len bytes consumed)
+            Accepts if >=1 record parsed AND pos ends exactly at len(data).
+            """
+            pos = 0
+            count = 0
+            while pos + 3 <= len(data):  # Match Android available()>=3
+                unit_id = data[pos]
+                flags = data[pos + 1]
+                state_len = flags & 0x0F
+                # 0 and 255 are Classic control bytes, not valid unit records
+                # inside a record stream (handled at dispatch level).
+                if unit_id == 0 or unit_id == 255:
+                    return False
+                pos += 2
+                if unit_id == 0xF0:
+                    # Command response: cmd_id(1) + seq(1) + payload(state_len-2).
+                    if state_len < 2:
+                        return False
+                    pos += state_len
+                else:
+                    has_extra1 = (flags & 0x20) != 0
+                    has_extra2 = (flags & 0x40) != 0
+                    pos += int(has_extra1) + int(has_extra2) + state_len
+                if pos > len(data):
+                    return False
+                count += 1
+            return count >= 1 and pos == len(data)
+
         def _plausible_payload(payload: bytes) -> bool:
             if not payload:
                 return False
@@ -1637,6 +1670,12 @@ class CasambiClient:
             if len(payload) >= 2:
                 rec_len = (payload[0] - 239) & 0xFF
                 if 2 <= rec_len <= len(payload):
+                    return True
+            # Classic unit state record stream or control byte.
+            if self._protocolMode == ProtocolMode.CLASSIC:
+                if payload[0] in (0, 255):
+                    return True
+                if _walk_classic_records(payload):
                     return True
             return False
 
