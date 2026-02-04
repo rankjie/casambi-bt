@@ -484,7 +484,30 @@ class Casambi:
         :param level: An optional relative brightness for all units in the scene.
         :return: Nothing is returned by this function. To get the new state register a change handler.
         """
-        await self.setLevel(target, level)  # type: ignore[arg-type]
+        if level < 0 or level > 255:
+            raise ValueError()
+
+        if self._casaClient is None:
+            raise ConnectionStateError(
+                ConnectionState.AUTHENTICATED,
+                ConnectionState.NONE,
+            )
+
+        # Classic scenes use a dedicated command type (CommandTypeSceneLevel = ordinal 1).
+        # Ground truth: casambi-android `u1.C1751c.u(float, P1)` builds payload [level,0,0,1]
+        # and targets the scene id.
+        if self._casaClient.protocolMode == ProtocolMode.CLASSIC:
+            payload = bytes([level, 0x00, 0x00, 0x01])
+            cmd = self._casaClient.buildClassicCommand(
+                1,
+                payload,
+                target_id=target.sceneId,
+            )
+            await self._casaClient.send(cmd)
+            return
+
+        # EVO/INVOCATION: use SetLevel with a scene target selector.
+        await self._send(target, level.to_bytes(1, byteorder="big", signed=False), OpCode.SetLevel)
 
     async def _send(
         self, target: Unit | Group | Scene | None, state: bytes, opcode: OpCode
