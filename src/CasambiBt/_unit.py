@@ -1,4 +1,5 @@
 import logging
+import os
 from binascii import b2a_hex as b2a
 from colorsys import hsv_to_rgb, rgb_to_hsv
 from dataclasses import dataclass
@@ -342,6 +343,8 @@ class Unit:
 
     unitType: UnitType
     securityKey: bytes | None = None
+    networkProtocolVersion: int | None = None
+    networkGrade: int | None = None
 
     _state: UnitState | None = None
     _on: bool = False
@@ -368,6 +371,24 @@ class Unit:
     def online(self) -> bool:
         return self._online
 
+    def _prefer_raw_rgb(self) -> bool:
+        """Return True if RGB control should be interpreted as raw RGB components.
+
+        Some Classic networks (notably grade=0) appear to represent RGB controls as
+        packed R/G/B components rather than Hue/Saturation.
+        """
+        env_mode = os.environ.get("CASAMBI_BT_RGB_ENCODING", "").strip().lower()
+        if env_mode in ("raw", "rgb", "component", "components"):
+            return True
+        if env_mode in ("hs", "hsv", "huesat", "hue-sat"):
+            return False
+
+        return (
+            self.networkProtocolVersion is not None
+            and self.networkProtocolVersion < 10
+            and self.networkGrade == 0
+        )
+
     # TODO: Add tests for this method
     def getStateAsBytes(self, state: UnitState) -> bytes:
         """Given a generic UnitState convert it into the internal state representation.
@@ -388,28 +409,28 @@ class Unit:
                 scale = UnitState.VERTICAL_RESOLUTION - c.length
                 scaledValue = state.vertical >> scale
             elif c.type == UnitControlType.RGB and state.rgb is not None:
-                hueLen = (c.length * 10) // 18
-                hueMask = 2**hueLen - 1
-                satLen = c.length - hueLen
-                satMask = 2**satLen - 1
+                if (
+                    self._prefer_raw_rgb()
+                    and c.length % 3 == 0
+                    and (c.length // 3) <= UnitState.RGB_RESOLUTION
+                ):
+                    compLen = c.length // 3
+                    scale = UnitState.RGB_RESOLUTION - compLen
+                    scaledValue = 0
+                    value = state.rgb
+                    for i in range(3):
+                        scaledValue += (value[i] >> scale) * 2 ** (compLen * (2 - i))
+                else:
+                    hueLen = (c.length * 10) // 18
+                    hueMask = 2**hueLen - 1
+                    satLen = c.length - hueLen
+                    satMask = 2**satLen - 1
 
-                h, s = state.hs  # type: ignore[misc]
+                    h, s = state.hs  # type: ignore[misc]
 
-                scaledValue = ((round(h * hueMask) & hueMask) << satLen) + (
-                    round(s * satMask) & satMask
-                )
-
-                # Old RGB code (might still be useful for earlier protocol versions):
-                """
-                assert c.length % 3 == 0, "Invalid RGB length"
-                scale = UnitState.RGB_RESOLUTION - (c.length // 3)
-                scaledValue = 0
-                value = state.rgb
-                for i in range(3):
-                    scaledValue += (value[i] >> scale) * 2 ** (
-                        (c.length // 3) * (2 - i)
+                    scaledValue = ((round(h * hueMask) & hueMask) << satLen) + (
+                        round(s * satMask) & satMask
                     )
-                """
             elif c.type == UnitControlType.WHITE and state.white is not None:
                 scale = UnitState.WHITE_RESOLUTION - c.length
                 scaledValue = state.white >> scale
@@ -512,29 +533,31 @@ class Unit:
                 scale = UnitState.VERTICAL_RESOLUTION - c.length
                 self._state.vertical = cInt << scale
             elif c.type == UnitControlType.RGB:
-                hueLen = (c.length * 10) // 18
-                hueMask = 2**hueLen - 1
-                satLen = c.length - hueLen
-                satMask = 2**satLen - 1
+                if (
+                    self._prefer_raw_rgb()
+                    and c.length % 3 == 0
+                    and (c.length // 3) <= UnitState.RGB_RESOLUTION
+                ):
+                    compLen = c.length // 3
+                    scale = UnitState.RGB_RESOLUTION - compLen
+                    rgb = []
 
-                h = (cInt >> satLen) / hueMask
-                s = (cInt & satMask) / satMask
+                    # Extract components from int and scale them
+                    for i in range(3):
+                        v = (cInt >> ((2 - i) * compLen)) & (2**compLen - 1)
+                        v <<= scale
+                        rgb.append(v)
+                    self._state.rgb = tuple(rgb)
+                else:
+                    hueLen = (c.length * 10) // 18
+                    hueMask = 2**hueLen - 1
+                    satLen = c.length - hueLen
+                    satMask = 2**satLen - 1
 
-                self._state.hs = (h, s)
-                # Old RGB Code (might still be useful for earlier protocol versions):
-                """
-                assert c.length % 3 == 0, "Invalid RGB length"
-                compLen = c.length // 3
-                rgb = []
-                scale = UnitState.RGB_RESOLUTION - compLen
+                    h = (cInt >> satLen) / hueMask
+                    s = (cInt & satMask) / satMask
 
-                # Extract components from int and scale them
-                for i in range(3):
-                    v = (cInt >> ((2 - i) * compLen)) & (2 ** compLen - 1)
-                    v <<= scale
-                    rgb.append(v)
-                self._state.rgb = tuple(rgb)
-                """
+                    self._state.hs = (h, s)
             elif c.type == UnitControlType.WHITE:
                 scale = UnitState.WHITE_RESOLUTION - c.length
                 self._state.white = cInt << scale

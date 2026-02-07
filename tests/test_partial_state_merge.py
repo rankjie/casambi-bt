@@ -68,7 +68,42 @@ class TestPartialStateMerge(unittest.TestCase):
         self.assertEqual(u.state.dimmer, 0x10)
         self.assertEqual(u.state.white, 0x99)
 
+    def test_rgb_decoding_prefers_raw_on_classic_grade0(self) -> None:
+        # 12-bit packed RGB: 4 bits per component (R,G,B).
+        # Encoded as 0xF00 (R=15,G=0,B=0), stored little-endian => 00 0F.
+        ut = UnitType(
+            id=2,
+            model="rgb-test",
+            manufacturer="test",
+            mode="",
+            stateLength=2,
+            controls=[
+                UnitControl(
+                    type=UnitControlType.RGB,
+                    offset=0,
+                    length=12,
+                    default=0,
+                    readonly=False,
+                ),
+            ],
+        )
+
+        u = Unit(
+            _typeId=ut.id,
+            deviceId=21,
+            uuid="dummy",
+            address="00:00:00:00:00:00",
+            name="dummy",
+            firmwareVersion="0",
+            unitType=ut,
+            networkProtocolVersion=5,
+            networkGrade=0,
+        )
+        u.setStateFromBytes(bytes.fromhex("000f"))
+
+        assert u.state is not None
+        self.assertEqual(u.state.rgb, (240, 0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
-

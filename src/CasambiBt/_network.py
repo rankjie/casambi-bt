@@ -45,6 +45,7 @@ class Network:
         self._networkName: str | None = None
         self._networkRevision: int | None = None
         self._protocolVersion: int = -1
+        self._grade: int | None = None
         # Classic networks do not have a `keyStore`; instead they expose visitor/manager keys.
         # Ground truth: casambi-android `D1.Z0` exports `visitorKey`/`managerKey`.
         self._classicVisitorKey: bytes | None = None
@@ -207,6 +208,11 @@ class Network:
     def protocolVersion(self) -> int:
         return self._protocolVersion
 
+    @property
+    def grade(self) -> int | None:
+        """Network grade (aka firmware grade) if present in the cloud profile."""
+        return self._grade
+
     def classicVisitorKey(self) -> bytes | None:
         return self._classicVisitorKey
 
@@ -357,6 +363,11 @@ class Network:
         # Prase general information
         self._networkName = network["network"]["name"]
         self._protocolVersion = network["network"]["protocolVersion"]
+        grade = network["network"].get("grade")
+        try:
+            self._grade = int(grade) if grade is not None else None
+        except (TypeError, ValueError):
+            self._grade = None
 
         # Parse keys if there are any. Otherwise the network is probably a classic network.
         if "keyStore" in network["network"]:
@@ -435,6 +446,8 @@ class Network:
                 str(u["firmware"]),
                 uType,
                 securityKey=security_key,
+                networkProtocolVersion=self._protocolVersion,
+                networkGrade=self._grade,
             )
             self.units.append(uObj)
 
@@ -443,10 +456,11 @@ class Network:
         level = logging.WARNING if self._protocolVersion < 10 else logging.INFO
         self._logger.log(
             level,
-            "[CASAMBI_NETWORK_PROFILE] uuid=%s id=%s protocolVersion=%s units=%d units_with_securityKey=%d keyStore=%s",
+            "[CASAMBI_NETWORK_PROFILE] uuid=%s id=%s protocolVersion=%s grade=%s units=%d units_with_securityKey=%d keyStore=%s",
             self._uuid,
             self._id,
             self._protocolVersion,
+            self._grade,
             len(self.units),
             units_with_security_key,
             "keyStore" in network["network"],

@@ -2190,7 +2190,7 @@ class CasambiClient:
                         "sid": None,
                         "extra_byte": extra1,
                         "extra_float": extra1 / 255.0 if extra1 else 0.0,
-                        "state_byte_offset": extra2,
+                        "classic_extra2": extra2,
                     },
                 )
 
