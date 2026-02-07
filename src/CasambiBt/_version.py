@@ -7,4 +7,4 @@ Avoid using importlib.metadata in hot paths by providing a static version string
 __all__ = ["__version__"]
 
 # NOTE: Must match `casambi-bt/setup.cfg` [metadata] version.
-__version__ = "0.4.2.dev1"
+__version__ = "0.4.2.dev2"
