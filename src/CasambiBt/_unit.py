@@ -457,21 +457,48 @@ class Unit:
         return bytes(res)
 
     # TODO: Add tests for this method
-    def setStateFromBytes(self, value: bytes) -> None:
+    def setStateFromBytes(self, value: bytes, *, byte_offset: int = 0) -> None:
         """Parse state bytes into a `UnitState` and set it for the current unit.
 
-        :param value: State bytes for the unit.
+        Supports partial updates by merging the received bytes into a full-length
+        state buffer before decoding controls.
+
+        :param value: State bytes for the unit (may be partial).
+        :param byte_offset: Byte offset where `value` applies within the full unit state.
         """
+        full_state_len = self.unitType.stateLength
+        if byte_offset < 0:
+            byte_offset = 0
+        if byte_offset > full_state_len:
+            byte_offset = full_state_len
+
         if not self._state:
             self._state = UnitState()
-        self._state._raw_state = value
+
+        # Always decode from a full-length buffer.
+        if (
+            self._state._raw_state is not None
+            and len(self._state._raw_state) == full_state_len
+        ):
+            merged = bytearray(self._state._raw_state)
+        else:
+            # Use a default-packed buffer rather than zero-fill to avoid manufacturing
+            # impossible values for unset controls on the first partial update.
+            merged = bytearray(self.getStateAsBytes(UnitState()))
+
+        end_offset = min(byte_offset + len(value), full_state_len)
+        if end_offset > byte_offset:
+            merged[byte_offset:end_offset] = value[: end_offset - byte_offset]
+
+        merged_bytes = bytes(merged)
+        self._state._raw_state = merged_bytes
         self._state._unknown_controls = []
 
         # TODO: Support for resolutions >8 byte?
         for c in self.unitType.controls:
             # Extract all relevant bytes from the state
             byteLen = (c.length + c.offset % 8 - 1) // 8 + 1
-            cBytes = value[c.offset // 8 : c.offset // 8 + byteLen]
+            cBytes = merged_bytes[c.offset // 8 : c.offset // 8 + byteLen]
 
             # Extract c.Length bits form the byte string
             cInt = int.from_bytes(cBytes, byteorder="little", signed=False)
@@ -539,7 +566,7 @@ class Unit:
                 )
                 self._state._unknown_controls.append((c.offset, c.length, cInt))
 
-        _LOGGER.debug(f"Parsed {b2a(value)} to {self.state.__repr__()}")
+        _LOGGER.debug(f"Parsed {b2a(merged_bytes)} to {self.state.__repr__()}")
 
 
 @dataclass

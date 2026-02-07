@@ -565,7 +565,27 @@ class Casambi:
             for u in self._casaNetwork.units:  # type: ignore[union-attr]
                 if u.deviceId == data["id"]:
                     found = True
-                    u.setStateFromBytes(data["state"])
+                    byte_offset = int(data.get("state_byte_offset", 0) or 0)
+                    state_len = u.unitType.stateLength
+                    if byte_offset < 0 or byte_offset > state_len:
+                        self._logger.warning(
+                            "Invalid state_byte_offset %s for unit %s (stateLength=%s); using 0",
+                            byte_offset,
+                            data["id"],
+                            state_len,
+                        )
+                        byte_offset = 0
+                    elif byte_offset + len(data["state"]) > state_len:
+                        self._logger.warning(
+                            "Invalid state_byte_offset %s for unit %s (stateLength=%s, payload_len=%s); using 0",
+                            byte_offset,
+                            data["id"],
+                            state_len,
+                            len(data["state"]),
+                        )
+                        byte_offset = 0
+
+                    u.setStateFromBytes(data["state"], byte_offset=byte_offset)
                     u._on = data["on"]
                     u._online = data["online"]
 
