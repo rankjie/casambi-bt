@@ -389,6 +389,33 @@ class Unit:
             and self.networkGrade == 0
         )
 
+    @staticmethod
+    def _scale_u8_to_bits(value_u8: int, bits: int) -> int:
+        """Scale an 8-bit value (0..255) to a `bits`-wide integer (0..(2**bits-1))."""
+        if bits <= 0:
+            return 0
+        mask = (1 << bits) - 1
+        if mask <= 0:
+            return 0
+        if mask == 0xFF:
+            return value_u8 & 0xFF
+        # Round to nearest representable value.
+        return (value_u8 * mask + 127) // 255
+
+    @staticmethod
+    def _scale_bits_to_u8(value_bits: int, bits: int) -> int:
+        """Scale a `bits`-wide integer (0..(2**bits-1)) to 8-bit (0..255)."""
+        if bits <= 0:
+            return 0
+        mask = (1 << bits) - 1
+        if mask <= 0:
+            return 0
+        value_bits &= mask
+        if mask == 0xFF:
+            return value_bits
+        # Round to nearest u8.
+        return (value_bits * 255 + (mask // 2)) // mask
+
     # TODO: Add tests for this method
     def getStateAsBytes(self, state: UnitState) -> bytes:
         """Given a generic UnitState convert it into the internal state representation.
@@ -403,11 +430,9 @@ class Unit:
         # Parse and convert state
         for c in self.unitType.controls:
             if c.type == UnitControlType.DIMMER and state.dimmer is not None:
-                scale = UnitState.DIMMER_RESOLUTION - c.length
-                scaledValue = state.dimmer >> scale
+                scaledValue = self._scale_u8_to_bits(state.dimmer, c.length)
             elif c.type == UnitControlType.VERTICAL and state.vertical is not None:
-                scale = UnitState.VERTICAL_RESOLUTION - c.length
-                scaledValue = state.vertical >> scale
+                scaledValue = self._scale_u8_to_bits(state.vertical, c.length)
             elif c.type == UnitControlType.RGB and state.rgb is not None:
                 if (
                     self._prefer_raw_rgb()
@@ -415,11 +440,20 @@ class Unit:
                     and (c.length // 3) <= UnitState.RGB_RESOLUTION
                 ):
                     compLen = c.length // 3
-                    scale = UnitState.RGB_RESOLUTION - compLen
-                    scaledValue = 0
-                    value = state.rgb
-                    for i in range(3):
-                        scaledValue += (value[i] >> scale) * 2 ** (compLen * (2 - i))
+                    rgb_mask = 2**compLen - 1
+
+                    r, g, b = state.rgb
+                    r_bits = self._scale_u8_to_bits(r, compLen) & rgb_mask
+                    g_bits = self._scale_u8_to_bits(g, compLen) & rgb_mask
+                    b_bits = self._scale_u8_to_bits(b, compLen) & rgb_mask
+
+                    # Match casambi-android (v3.16) packing for raw RGB controls:
+                    # lowest bits = R, then G, highest = B.
+                    scaledValue = (
+                        (r_bits << (compLen * 0))
+                        | (g_bits << (compLen * 1))
+                        | (b_bits << (compLen * 2))
+                    )
                 else:
                     hueLen = (c.length * 10) // 18
                     hueMask = 2**hueLen - 1
@@ -432,8 +466,7 @@ class Unit:
                         round(s * satMask) & satMask
                     )
             elif c.type == UnitControlType.WHITE and state.white is not None:
-                scale = UnitState.WHITE_RESOLUTION - c.length
-                scaledValue = state.white >> scale
+                scaledValue = self._scale_u8_to_bits(state.white, c.length)
             elif (
                 c.type == UnitControlType.TEMPERATURE
                 and state.temperature is not None
@@ -453,8 +486,7 @@ class Unit:
                 xyMask = 2**coordLen - 1
                 scaledValue = (round(x * xyMask) << coordLen) | round(y * xyMask)
             elif c.type == UnitControlType.SLIDER and state.slider is not None:
-                scale = UnitState.SLIDER_RESOLUTION - c.length
-                scaledValue = state.slider >> scale
+                scaledValue = self._scale_u8_to_bits(state.slider, c.length)
             elif c.type == UnitControlType.ONOFF and state.onoff is not None:
                 scaledValue = 1 if state.onoff else 0
 
@@ -527,11 +559,9 @@ class Unit:
             cInt &= 2**c.length - 1
 
             if c.type == UnitControlType.DIMMER:
-                scale = UnitState.DIMMER_RESOLUTION - c.length
-                self._state.dimmer = cInt << scale
+                self._state.dimmer = self._scale_bits_to_u8(cInt, c.length)
             elif c.type == UnitControlType.VERTICAL:
-                scale = UnitState.VERTICAL_RESOLUTION - c.length
-                self._state.vertical = cInt << scale
+                self._state.vertical = self._scale_bits_to_u8(cInt, c.length)
             elif c.type == UnitControlType.RGB:
                 if (
                     self._prefer_raw_rgb()
@@ -539,15 +569,18 @@ class Unit:
                     and (c.length // 3) <= UnitState.RGB_RESOLUTION
                 ):
                     compLen = c.length // 3
-                    scale = UnitState.RGB_RESOLUTION - compLen
-                    rgb = []
+                    rgb_mask = 2**compLen - 1
 
-                    # Extract components from int and scale them
-                    for i in range(3):
-                        v = (cInt >> ((2 - i) * compLen)) & (2**compLen - 1)
-                        v <<= scale
-                        rgb.append(v)
-                    self._state.rgb = tuple(rgb)
+                    # Match casambi-android (v3.16) unpacking for raw RGB controls:
+                    # lowest bits = R, then G, highest = B.
+                    r_bits = cInt & rgb_mask
+                    g_bits = (cInt >> compLen) & rgb_mask
+                    b_bits = (cInt >> (2 * compLen)) & rgb_mask
+
+                    r = self._scale_bits_to_u8(r_bits, compLen)
+                    g = self._scale_bits_to_u8(g_bits, compLen)
+                    b = self._scale_bits_to_u8(b_bits, compLen)
+                    self._state.rgb = (r, g, b)
                 else:
                     hueLen = (c.length * 10) // 18
                     hueMask = 2**hueLen - 1
@@ -559,8 +592,7 @@ class Unit:
 
                     self._state.hs = (h, s)
             elif c.type == UnitControlType.WHITE:
-                scale = UnitState.WHITE_RESOLUTION - c.length
-                self._state.white = cInt << scale
+                self._state.white = self._scale_bits_to_u8(cInt, c.length)
             elif c.type == UnitControlType.TEMPERATURE:
                 if not c.max or not c.min:
                     _LOGGER.warning("Can't set temperature when min or max unknown.")
@@ -578,8 +610,7 @@ class Unit:
                 x = (cInt >> coordLen) & xyMask
                 self._state.xy = (x / xyMask, y / xyMask)
             elif c.type == UnitControlType.SLIDER:
-                scale = UnitState.SLIDER_RESOLUTION - c.length
-                self._state.slider = cInt << scale
+                self._state.slider = self._scale_bits_to_u8(cInt, c.length)
             elif c.type == UnitControlType.ONOFF:
                 self._state.onoff = cInt != 0
             elif c.type == UnitControlType.UNKOWN:

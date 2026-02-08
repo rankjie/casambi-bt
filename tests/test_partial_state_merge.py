@@ -70,7 +70,7 @@ class TestPartialStateMerge(unittest.TestCase):
 
     def test_rgb_decoding_prefers_raw_on_classic_grade0(self) -> None:
         # 12-bit packed RGB: 4 bits per component (R,G,B).
-        # Encoded as 0xF00 (R=15,G=0,B=0), stored little-endian => 00 0F.
+        # Encoded as 0x00F (R=15,G=0,B=0), stored little-endian => 0F 00.
         ut = UnitType(
             id=2,
             model="rgb-test",
@@ -99,10 +99,10 @@ class TestPartialStateMerge(unittest.TestCase):
             networkProtocolVersion=5,
             networkGrade=0,
         )
-        u.setStateFromBytes(bytes.fromhex("000f"))
+        u.setStateFromBytes(bytes.fromhex("0f00"))
 
         assert u.state is not None
-        self.assertEqual(u.state.rgb, (240, 0, 0))
+        self.assertEqual(u.state.rgb, (255, 0, 0))
 
 
 if __name__ == "__main__":
