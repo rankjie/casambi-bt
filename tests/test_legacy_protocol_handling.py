@@ -37,6 +37,19 @@ class _StubGattClient:
         raise AssertionError("start_notify should not be called for short/invalid NodeInfo")
 
 
+class _DisconnectingGattClient:
+    is_connected = False
+
+    def __init__(self, client: CasambiClient) -> None:
+        self._client = client
+
+    async def read_gatt_char(self, _uuid: str) -> bytes:
+        return b"\x01\x2b\x9e\x00\x18\x00\xf0" + (b"\x01" * 16)
+
+    async def start_notify(self, *_args, **_kwargs) -> None:
+        self._client._on_disconnect(self)  # noqa: SLF001
+
+
 class TestLegacyProtocolHandling(unittest.TestCase):
     def test_checkProtocolVersion_legacy_warns_by_default(self) -> None:
         def cb(_: IncommingPacketType, __: dict) -> None:
@@ -55,6 +68,17 @@ class TestExchangeKeyNodeInfoGuards(unittest.IsolatedAsyncioTestCase):
         c = CasambiClient("00:00:00:00:00:00", cb, lambda: None, _DummyNetwork())
         c._connectionState = ConnectionState.CONNECTED
         c._gattClient = _StubGattClient(b"\x01\x0b")  # NodeInfo prefix but too short
+
+        with self.assertRaises(ProtocolError):
+            await c.exchangeKey()
+
+    async def test_exchangeKey_disconnect_while_waiting_for_notify_raises(self) -> None:
+        def cb(_: IncommingPacketType, __: dict) -> None:
+            return
+
+        c = CasambiClient("00:00:00:00:00:00", cb, lambda: None, _DummyNetwork())
+        c._connectionState = ConnectionState.CONNECTED
+        c._gattClient = _DisconnectingGattClient(c)
 
         with self.assertRaises(ProtocolError):
             await c.exchangeKey()
