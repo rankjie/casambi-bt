@@ -2338,14 +2338,15 @@ class CasambiClient:
         )
 
         self._logger.debug(
-            "[CASAMBI_SWITCH_SUMMARY] packet=%s frames=%d button_frames=%d input_frames=%d ignored=%d emitted=%d suppressed_same_state=%d",
+            "[CASAMBI_SWITCH_SUMMARY] packet=%s frames=%d button_frames=%d input_frames=%d ignored=%d emitted=%d suppressed_copies=%d suppressed_paired=%d",
             packet_seq,
             stats.frames_total,
             stats.frames_button,
             stats.frames_input,
             stats.frames_ignored,
             stats.events_emitted,
-            stats.events_suppressed_same_state,
+            stats.events_suppressed_copies,
+            stats.events_suppressed_paired,
         )
 
         for ev in events:

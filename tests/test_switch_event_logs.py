@@ -128,18 +128,17 @@ class TestSwitchEventsFromLogs(unittest.TestCase):
             events.extend(evs)
 
         semantic = [e for e in events if e.get("event") in ("button_press", "button_release", "button_hold", "button_release_after_hold")]
-        # Long press: press, (optional hold), release, (optional release-after-hold from input stream)
-        self.assertGreaterEqual(len(semantic), 2)
-        self.assertEqual(semantic[0]["event"], "button_press")
-        self.assertIn(semantic[-1]["event"], ("button_release", "button_release_after_hold"))
-        self.assertEqual(semantic[0]["unit_id"], 31)
-        self.assertEqual(semantic[0]["button"], 1)
-        self.assertEqual(semantic[-1]["unit_id"], 31)
-        self.assertEqual(semantic[-1]["button"], 1)
-
-        # Ensure no consecutive same-state spam remains.
-        for prev, cur in zip(semantic, semantic[1:]):
-            self.assertNotEqual(prev["event"], cur["event"])
+        # One physical long press -> exactly press, hold, release-after-hold. The ButtonEvent
+        # release (2410 ms) and the NotifyInput 0x0c describe the same release and pair up.
+        self.assertEqual(
+            [e["event"] for e in semantic],
+            ["button_press", "button_hold", "button_release_after_hold"],
+        )
+        for e in semantic:
+            self.assertEqual(e["unit_id"], 31)
+            self.assertEqual(e["button"], 1)
+        self.assertEqual(semantic[-1]["press_duration_ms"], 2410)
+        self.assertTrue(semantic[-1]["held"])
 
     def test_android_capture_button_label_mapping(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
@@ -172,7 +171,7 @@ class TestSwitchEventsFromLogs(unittest.TestCase):
         self.assertEqual(btn_b4[0]["button"], 4)
         self.assertEqual(btn_b4[0]["button_event_index"], 0)
 
-    def test_notify_input_fields_are_exposed(self) -> None:
+    def test_notify_input_release_arriving_first_is_the_emitted_release(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
         log_path = repo_root / "testlogs" / "another_wireless_single_press.log"
         payloads = _extract_switch_payloads_from_log(log_path)
@@ -180,26 +179,41 @@ class TestSwitchEventsFromLogs(unittest.TestCase):
 
         dec = SwitchEventStreamDecoder()
         events: list[dict] = []
+        paired = 0
         for p in payloads:
-            evs, _ = dec.decode(p)
+            evs, stats = dec.decode(p)
             events.extend(evs)
+            paired += stats.events_suppressed_paired
 
-        # In the captured log we have a NotifyInput frame with payload 0209:
-        # input_code=0x02 (release), channel=(0x09&7)=1, value16 absent (len=2).
-        notify = [
-            e
-            for e in events
-            if e.get("target_type") == 0x12 and e.get("opcode") == 0x41 and e.get("payload_hex") == b"0209"
-        ]
-        self.assertGreaterEqual(len(notify), 1)
-        e0 = notify[0]
-        self.assertEqual(e0["event"], "input_event")
+        # In this capture the NotifyInput 0209 (age 10) reached us before the ButtonEvent
+        # release (age 32). Exactly one release must come out, carrying the NotifyInput fields,
+        # and the later ButtonEvent release must be consumed as its pair.
+        releases = [e for e in events if e.get("event") == "button_release"]
+        self.assertEqual(len(releases), 1)
+        e0 = releases[0]
+        self.assertEqual(e0["source"], "notify_input")
         self.assertEqual(e0["input_code"], 0x02)
         self.assertEqual(e0["input_b1"], 0x09)
         self.assertEqual(e0["input_channel"], 1)
         self.assertIsNone(e0["input_value16"])
-        self.assertEqual(e0["input_mapped_event"], "button_release")
+        self.assertEqual(paired, 1)
+        self.assertEqual([e["event"] for e in events], ["button_press", "button_release"])
 
+    def test_wireless_single_press_release_carries_duration(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        log_path = repo_root / "testlogs" / "single_press_wireless_unit_31_button_1.log"
+        payloads = _extract_switch_payloads_from_log(log_path)
+
+        dec = SwitchEventStreamDecoder()
+        events: list[dict] = []
+        for p in payloads:
+            evs, _ = dec.decode(p)
+            events.extend(evs)
+
+        self.assertEqual([e["event"] for e in events], ["button_press", "button_release"])
+        self.assertEqual(events[1]["source"], "button_event")
+        self.assertEqual(events[1]["press_duration_ms"], 180)
+        self.assertFalse(events[1]["held"])
 
 if __name__ == "__main__":
     unittest.main()

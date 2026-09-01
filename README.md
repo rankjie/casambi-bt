@@ -28,12 +28,15 @@ Have a look at `demo.py` for a small example.
 
 This library supports receiving physical switch events as a decoded stream of INVOCATION frames (ground truth from the official Android app).
 
-Event types you can expect:
+Event types you can expect, exactly one per physical action:
 - `button_press`
-- `button_release`
-- `button_hold`
+- `button_release` (short press; `press_duration_ms` is set when reported by the switch itself)
+- `button_hold` (long press threshold reached)
 - `button_release_after_hold`
-- `input_event` (raw NotifyInput frame that may accompany presses/holds; useful for diagnostics and some wired devices)
+- `input_event` (NotifyInput frame with an unknown code; diagnostics only)
+
+Every event also carries `source` (`button_event` = the switch's own ButtonEvent stream,
+`notify_input` = NotifyInput stream) and `held` (True for hold / release-after-hold).
 
 ```python
 from CasambiBt import Casambi
@@ -69,9 +72,9 @@ casa.registerSwitchEventHandler(handle_switch_event)
 ```
 
 Notes:
-- Wireless (battery) switches typically send a "button stream" (target_type `0x06`) for press/release, and a NotifyInput stream (target_type `0x12`) for hold/release-after-hold.
-- Wired switches often only send NotifyInput (target_type `0x12`), so `input_code` is mapped into `button_press/button_release/...` when appropriate.
-- The library suppresses same-state retransmits at the protocol layer (edge detection), so Home Assistant-style time-window deduplication should generally not be necessary.
+- Wireless (battery) switches send a "button stream" (target_type `0x06`) for press/release with the press duration; a mains unit additionally reports the same action as NotifyInput (target_type `0x12`), which is also the only carrier of hold.
+- Wired switches often only send NotifyInput (target_type `0x12`); its `input_code` is mapped into `button_press/button_release/...`.
+- The mesh re-floods every frame several times. The library drops these copies by invocation identity (origin handle + opcode + target + payload) and pairs the two streams by count, so no per-button state is kept and a lost or reordered frame never swallows a later press. Consumers do not need their own deduplication.
 
 For the parsing details and field layout, see `doc/PROTOCOL_PARSING.md`.
 

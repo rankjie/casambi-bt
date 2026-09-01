@@ -75,19 +75,30 @@ The first payload byte encodes:
 - `P = (payload[0] >> 3) & 0x0F`
 - `S = payload[0] & 0x07`
 
+Observed payload layout (captures of LEDsGO 4CHANNEL_SW EVO):
+- `P` equals the button index.
+- `payload[1..2]` (big-endian) is the press duration in 10 ms ticks: `0x0002` on press frames,
+  130-220 ms on short-press releases, 1.9-3.5 s on long-press releases.
+
 Python mapping:
 - `casambi-bt/src/CasambiBt/_switch_events.py` treats these as semantic events:
   - `pressed -> "button_press"`
-  - `!pressed -> "button_release"`
-- 4-gang label mapping observed in Android captures:
+  - `!pressed -> "button_release"`, or `"button_release_after_hold"` when the duration is >= 500 ms
+  - `press_duration_ms` and `held` are exposed on the event
+- 4-gang label mapping observed in Android captures (matches `switchConfig.switches[].index + 1`):
   - ButtonEvent0 -> label 4
   - ButtonEvent1 -> label 1
   - ButtonEvent2 -> label 2
   - ButtonEvent3 -> label 3
 
-Duplicate handling:
-- Wireless switches retransmit the same pressed state multiple times.
-- The decoder suppresses repeated same-state frames per `(unit_id, button_event_index)` ("edge detection").
+Duplicate handling (all frame kinds):
+- `origin` is `unit << 8 | handle`; `handle` is the emitting unit's invocation counter and
+  advances with every invocation it sends, so two physical presses never share it.
+- `age` is in 10 ms ticks and `lifetime` (flags bits 11-14) in seconds. The mesh re-floods a
+  frame until its lifetime expires; every copy has the same origin/opcode/target/payload and a
+  larger `age`. Button frames were seen with lifetime 1 s, NotifyInput with 2 s.
+- The decoder drops a frame whose `(origin, opcode, target, payload)` was already processed in
+  the last 3 s. No "currently pressed" state is kept, so a lost frame cannot suppress a later one.
 
 ### NotifyInput Stream (target_type 0x12)
 
@@ -103,22 +114,27 @@ Android extracts:
 - `e = payload[0] & 0xFF` (we expose this as `input_code`)
 
 Python exposure:
-- Every NotifyInput frame is emitted at least as `event="input_event"` with:
-  - `input_index`, `input_code`, `input_b1`, `input_channel`, `input_value16`
-  - `input_mapped_event` (best-effort semantic meaning for `input_code`)
+- NotifyInput events carry `input_index`, `input_code`, `input_b1`, `input_channel`, `input_value16`
+  and `source="notify_input"`.
 
 Observed semantic mapping (from captures; Android itself only logs the bytes):
 - `input_code 0x01` -> `button_press`
 - `input_code 0x02` -> `button_release`
 - `input_code 0x09` -> `button_hold`
 - `input_code 0x0C` -> `button_release_after_hold`
+- anything else -> `input_event`
 
 Wired vs wireless behavior:
-- Wired switches may only send NotifyInput frames (no button stream). In that case, the library emits the mapped semantic events (`button_press`, etc).
-- Wireless switches usually have both streams; to avoid duplicates, NotifyInput `0x01/0x02` are not emitted as semantic press/release when the button stream was observed for that `(unit_id, button)`. Hold/release-after-hold are still surfaced.
+- Wired switches (e.g. Scemtec SC-TI-CAS) only send NotifyInput frames, from themselves; all
+  four codes are emitted as semantic events.
+- Wireless switches (e.g. LEDsGO 4CHANNEL_SW EVO) send the button stream themselves, and a
+  mains unit reports the same action as NotifyInput `0x02/0x09/0x0C` (never `0x01`), in either
+  order and up to ~1 s apart.
 
-Duplicate handling:
-- NotifyInput retransmits are suppressed per `(unit_id, input_index)` by ignoring repeated `input_code` values.
+Cross-source pairing:
+- For each `(unit_id, button, press|release)` the first report from either stream is emitted;
+  the report from the other stream inside 3 s is consumed (counted, not stateful). If one stream
+  loses a frame, the other one still produces the event.
 
 ## Packet Type 0x06: UnitState Stream
 
@@ -156,7 +172,7 @@ Stable log markers used for offline analysis:
 - `[CASAMBI_RAW_PACKET]` encrypted bytes with device sequence
 - `[CASAMBI_DECRYPTED]` decrypted bytes (includes packet type byte)
 - `[CASAMBI_SWITCH_PACKET]` type `0x07` payload bytes (INVOCATION stream)
-- `[CASAMBI_SWITCH_SUMMARY]` frame counts + suppression stats
+- `[CASAMBI_SWITCH_SUMMARY]` frame counts + copy/pair suppression stats
 - `[CASAMBI_UNITSTATE_PARSED]` decoded unit state record fields
 
 Log-driven tests:
