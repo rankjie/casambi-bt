@@ -3,9 +3,9 @@
 # Import everything that should be public
 # ruff: noqa: F401
 
-from ._version import __version__
 from ._casambi import Casambi
 from ._discover import discover
+from ._network_events import NetworkEventDecoder, input_observation
 from ._unit import (
     ColorSource,
     Group,
@@ -16,3 +16,4 @@ from ._unit import (
     UnitState,
     UnitType,
 )
+from ._version import __version__

@@ -94,6 +94,8 @@ class CasambiClient:
         dataCallback: Callable[[IncommingPacketType, dict[str, Any]], None],
         disonnectedCallback: Callable[[], None],
         network: Network,
+        invocationCallback: Callable[[bytes, int | None, int], None] | None = None,
+        receiveDiagnosticCallback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._gattClient: BleakClient = None  # type: ignore[assignment]
         self._notifySignal = asyncio.Event()
@@ -123,6 +125,8 @@ class CasambiClient:
         self._switchDecoder = SwitchEventStreamDecoder(self._logger)
         self._connectionState: ConnectionState = ConnectionState.NONE
         self._dataCallback = dataCallback
+        self._invocationCallback = invocationCallback
+        self._receiveDiagnosticCallback = receiveDiagnosticCallback
         self._disconnectedCallback = disonnectedCallback
         self._activityLock = asyncio.Lock()
 
@@ -763,11 +767,13 @@ class CasambiClient:
 
             # Respond to key exchange
             pubNums = self._pubKey.public_numbers()
+            # Match the network-client trailer in Android 3.21.0 lr.k0().
             keyExchResponse = struct.pack(
-                ">B32s32sB",
+                ">B32s32sBB",
                 0x2,
                 pubNums.x.to_bytes(32, byteorder="little", signed=False),
                 pubNums.y.to_bytes(32, byteorder="little", signed=False),
+                0x0D,
                 0x1,
             )
             await self._gattClient.write_gatt_char(CASA_AUTH_CHAR_UUID, keyExchResponse)
@@ -807,7 +813,15 @@ class CasambiClient:
                 await self._activityLock.acquire()
                 try:
                     self._callbackMulitplexer(handle, data)
-                except Exception:
+                except Exception as error:
+                    if self._receiveDiagnosticCallback is not None:
+                        self._receiveDiagnosticCallback(
+                            {
+                                "stage": "callback_error",
+                                "arrival_sequence": self._inPacketCount,
+                                "exception_type": type(error).__name__,
+                            }
+                        )
                     self._logger.warning(
                         "[CASAMBI_CALLBACK_ERROR] unhandled exception in callback multiplexer",
                         exc_info=True,
@@ -1544,10 +1558,32 @@ class CasambiClient:
                 data, data[:4] + self._nonce[4:]
             )
         except InvalidSignature:
+            if self._receiveDiagnosticCallback is not None:
+                self._receiveDiagnosticCallback(
+                    {
+                        "stage": "evo_receive",
+                        "arrival_sequence": self._inPacketCount,
+                        "packet_sequence": device_sequence,
+                        "wire_length": len(data),
+                        "verified": False,
+                        "packet_type": None,
+                    }
+                )
             # We only drop packets with invalid signature here instead of going into an error state
             self._logger.error(f"Invalid signature for packet {b2a(data)}!")
             return
 
+        if self._receiveDiagnosticCallback is not None:
+            self._receiveDiagnosticCallback(
+                {
+                    "stage": "evo_receive",
+                    "arrival_sequence": self._inPacketCount,
+                    "packet_sequence": device_sequence,
+                    "wire_length": len(data),
+                    "verified": True,
+                    "packet_type": decrypted_data[0] if decrypted_data else None,
+                }
+            )
         packetType = decrypted_data[0]
         if self._logger.isEnabledFor(logging.DEBUG):
             self._logger.debug(
@@ -2316,6 +2352,9 @@ class CasambiClient:
         as a stream of INVOCATION frames. Switch button events are INVOCATIONs.
         """
 
+        if self._invocationCallback is not None:
+            self._invocationCallback(data, packet_seq, self._inPacketCount)
+
         if self._logger.isEnabledFor(logging.DEBUG):
             data_hex = b2a(data)
             self._logger.debug(
@@ -2336,6 +2375,22 @@ class CasambiClient:
             raw_packet=raw_packet,
             arrival_sequence=self._inPacketCount,
         )
+
+        if self._receiveDiagnosticCallback is not None:
+            self._receiveDiagnosticCallback(
+                {
+                    "stage": "switch_decode",
+                    "arrival_sequence": self._inPacketCount,
+                    "packet_sequence": packet_seq,
+                    "frames": stats.frames_total,
+                    "button_frames": stats.frames_button,
+                    "input_frames": stats.frames_input,
+                    "ignored_frames": stats.frames_ignored,
+                    "legacy_emitted": stats.events_emitted,
+                    "suppressed_copies": stats.events_suppressed_copies,
+                    "suppressed_paired": stats.events_suppressed_paired,
+                }
+            )
 
         self._logger.debug(
             "[CASAMBI_SWITCH_SUMMARY] packet=%s frames=%d button_frames=%d input_frames=%d ignored=%d emitted=%d suppressed_copies=%d suppressed_paired=%d",

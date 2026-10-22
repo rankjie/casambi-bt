@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Casambi · 网络事件</title>
+<style>
+:root{color-scheme:light;--ink:#172c29;--muted:#61726c;--line:#dce5df;--green:#13795a;--paper:#f5f7f3}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1500px;margin:auto;padding:34px 40px}header{display:flex;justify-content:space-between;align-items:center;gap:20px}.eyebrow{font-size:11px;letter-spacing:.16em;color:var(--muted);font-weight:650}h1{font-size:32px;font-weight:600;letter-spacing:-.04em;margin:7px 0}button,a.button,select,input{font:inherit;border:1px solid #cbd8d0;border-radius:8px;background:white;padding:9px 13px;color:var(--ink)}button,a.button{cursor:pointer}button:hover,a.button:hover{background:#eaf0e9}a.button{text-decoration:none;display:inline-block}.actions{display:flex;gap:8px}#status{margin:18px 0 22px;display:flex;align-items:center;gap:9px;color:var(--muted)}#dot{width:8px;height:8px;border-radius:50%;background:#ca9343;flex-shrink:0}#dot.live{background:var(--green);box-shadow:0 0 0 4px #deeee5}#dot.error{background:#b43d2b}.stats{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:12px;background:#fff;margin-bottom:22px}.stat{padding:17px 23px}.stat+.stat{border-left:1px solid var(--line)}.stat span{color:var(--muted);font-size:12px}.stat strong{display:block;font-size:26px;font-weight:550;margin-top:2px}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:12px}.toolbar input{flex:1;min-width:140px}.note{font-size:12px;color:var(--muted);margin:11px 0}.table-wrap{border:1px solid var(--line);border-radius:12px;overflow:auto;background:white;max-height:65vh}table{width:100%;border-collapse:collapse;white-space:nowrap}th{text-align:left;background:#edf2ec;color:#52655c;font-size:11px;letter-spacing:.04em;position:sticky;top:0;z-index:1}th,td{padding:12px 16px;border-bottom:1px solid #e8eee8}td{vertical-align:top}tbody tr:hover{background:#f7faf6}.time,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.secondary{display:block;color:var(--muted);font-size:11px}.badge{display:inline-block;padding:3px 8px;border-radius:5px;background:#edf2e9;color:#446132;font:12px ui-monospace,monospace}.badge.input{background:#e8eefa;color:#435f9b}.badge.lux{background:#fff2d9;color:#956b17}.badge.presence{background:#e0f0e9;color:#13795a}details{max-width:460px}summary{color:var(--muted);font-size:12px;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;max-height:250px;overflow:auto}#empty{text-align:center;padding:65px 20px;color:var(--muted)}#empty strong{color:var(--ink);display:block;font-size:17px;font-weight:550;margin-bottom:8px}#notice{color:#9c5d14}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #79aa95;outline-offset:2px}@media(max-width:700px){main{padding:22px 16px}header{align-items:flex-start;flex-direction:column}.stats{margin-top:16px}.stat{padding:12px}.stat strong{font-size:23px}.toolbar{flex-wrap:wrap}.toolbar input{width:100%;flex:auto}h1{font-size:28px}th,td{padding:10px}}
+</style>
+<main>
+<header><div><div class="eyebrow">CASAMBI / LOCAL DIAGNOSTICS</div><h1>网络事件</h1><div id="network" class="secondary">本地蓝牙 · 官方 3.21.0 解析依据</div></div><div class="actions"><button id="pause" aria-pressed="false">暂停显示</button><a class="button" href="/export.json">导出 JSON</a></div></header>
+<div id="status" role="status"><span id="dot"></span><span id="status-text">正在读取连接状态…</span></div>
+<p class="note" id="receive-status">接收诊断等待连接…</p>
+<div class="stats"><div class="stat"><span>本次收到的事件</span><strong id="total">0</strong></div><div class="stat"><span>产生事件的设备</span><strong id="devices">0</strong></div><div class="stat"><span>开关通知 · input</span><strong id="switches">0</strong></div><div class="stat"><span>最近事件</span><strong id="latest">—</strong></div></div>
+<div class="toolbar"><input id="query" type="search" placeholder="搜索设备、编号、类型或事件值…" aria-label="搜索事件"><select id="type" aria-label="事件类型"><option value="">全部类型</option><option value="input">input · 开关/按键</option></select><select id="source" aria-label="事件来源"><option value="">全部来源</option><option value="unit_state">设备状态字段</option><option value="invocation">协议帧 · type 7</option></select><button id="reset">重置筛选</button></div>
+<div class="note"><span id="count">显示 0 条</span> · 最新事件在前 · 点击详情查看解码字段</div>
+<div class="table-wrap"><table><thead><tr><th>接收时间</th><th>设备</th><th>事件类型</th><th>值</th><th>来源 / 解析</th></tr></thead><tbody id="rows"></tbody></table><div id="empty"><strong>等待真实网络事件</strong>连接后会显示首次设备状态。按动开关或触发传感器，可观察后续变化。</div></div>
+<p class="note">按设备 profile 解码并抑制重复状态；input 保留两种原始开关通知，按协议索引显示，不按物理点击合并。通过 WebSocket 实时推送；时间为 Mac 接收时间。事件历史保存在 Mac；页面载入最近 5,000 条，导出包含已保存的全部事件。</p>
+<p class="note" id="notice" role="status"></p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let events = [], cursor = 0, session = '', paused = false, expired = 0, socket, reconnectDelay = 500;
+const types = new Set(['input']), rowNodes = new Map();
+function cell(row, value, cls) {
+  const td = document.createElement('td'); td.textContent = value;
+  if (cls) td.className = cls; row.append(td); return td;
+}
+function time(value) { return new Date(value).toLocaleTimeString('zh-CN', {hour12: false}); }
+function makeRow(event) {
+  const row = document.createElement('tr'); row.dataset.eventId = event.id;
+  const date = new Date(event.time);
+  cell(row, time(event.time) + '.' + String(date.getMilliseconds()).padStart(3, '0'), 'time');
+  const device = cell(row, event.name), id = document.createElement('span');
+  id.className = 'secondary'; id.textContent = event.unit == null ? '协议诊断' : 'Unit #' + event.unit; device.append(id);
+  const kind = cell(row, ''), badge = document.createElement('span');
+  badge.className = 'badge ' + event.type; badge.textContent = event.type; kind.append(badge);
+  const actions = {press:'按下', release:'松开', hold:'长按', release_after_hold:'长按后松开'};
+  const input = event.type === 'input';
+  const button = event.button == null ? `输入索引 ${event.button_index ?? event.button_event_index ?? event.input_index ?? '未知'}` : `第 ${event.button} 键`;
+  const value = cell(row, input ? `${button} · ${actions[event.input_action] || '输入通知'}` : event.value, 'mono');
+  if (input) { const raw = document.createElement('span'); raw.className = 'secondary'; raw.textContent = event.value; value.append(raw); }
+  const detail = cell(row, ''), expand = document.createElement('details');
+  const summary = document.createElement('summary'), pre = document.createElement('pre');
+  summary.textContent = event.source === 'unit_state' ? '设备状态 · ' + event.control : event.source_stream === 'button_event' ? 'ButtonEvent · 原始输入' : event.source_stream === 'notify_input' ? 'NotifyInput · 原始输入' : '协议帧 · ' + (event.opcode_name || event.type);
+  pre.textContent = JSON.stringify(event, null, 2); expand.append(summary, pre); detail.append(expand);
+  return row;
+}
+function render() {
+  const query = $('query').value.trim().toLowerCase(), type = $('type').value, source = $('source').value;
+  const filtered = events.filter(e => (!type || e.type === type) && (!source || e.source === source) &&
+    (!query || [e.unit, e.name, e.type, e.value, e.control, e.timestamp, e.button == null ? '' : `第 ${e.button} 键`, e.input_action].some(v => String(v ?? '').toLowerCase().includes(query))));
+  const shown = filtered.slice(-2000).reverse(), body = $('rows'), wrap = body.closest('.table-wrap');
+  const anchor = wrap.scrollTop > 0 ? Array.from(body.children).find(row => row.getBoundingClientRect().bottom > wrap.getBoundingClientRect().top + 45) : null;
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  const retainedIds = new Set(events.map(e => e.id)), visibleIds = new Set(shown.map(e => e.id));
+  for (const [id, row] of rowNodes) if (!retainedIds.has(id)) { row.remove(); rowNodes.delete(id); }
+  for (const row of Array.from(body.children)) if (!visibleIds.has(Number(row.dataset.eventId))) row.remove();
+  let next = body.firstElementChild;
+  for (const event of shown) {
+    let row = rowNodes.get(event.id);
+    if (!row) { row = makeRow(event); rowNodes.set(event.id, row); }
+    if (row === next) next = next.nextElementSibling;
+    else body.insertBefore(row, next);
+  }
+  if (anchor?.isConnected) wrap.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+  $('empty').hidden = shown.length > 0;
+  $('empty').firstElementChild.textContent = events.length ? '没有匹配的事件' : '等待真实网络事件';
+  $('count').textContent = `当前显示 ${shown.length.toLocaleString()} 条事件` + ((query || type || source) ? `（筛选后，共 ${events.length.toLocaleString()} 条已载入）` : '');
+  $('total').textContent = cursor.toLocaleString();
+  $('devices').textContent = new Set(events.map(e => e.unit)).size;
+  $('switches').textContent = events.filter(e => e.type === 'input').length.toLocaleString();
+  $('latest').textContent = events.length ? time(events.at(-1).time) : '—';
+  $('notice').textContent = [paused ? '显示已暂停，后台仍继续采集；恢复后补上保留的事件。' : '',
+    expired ? `另有 ${expired.toLocaleString()} 条历史事件保存在 Mac，导出可取得。` : '',
+    filtered.length > 2000 ? '表格显示最近 2,000 条匹配事件，导出可取得保留的全部事件。' : ''].filter(Boolean).join(' ');
+}
+function connect() {
+  socket = new WebSocket(`ws://${location.host}/ws?after=${cursor}&session=${encodeURIComponent(session)}`);
+  socket.onopen = () => { reconnectDelay = 500; };
+  socket.onmessage = message => {
+    const data = JSON.parse(message.data);
+    if (data.reset || session !== data.session) { events = []; rowNodes.clear(); $('rows').replaceChildren(); }
+    session = data.session; cursor = data.cursor; expired = data.expired;
+    events = events.concat(data.events).slice(-5000);
+    for (const event of data.events) if (!types.has(event.type)) {
+      types.add(event.type); const option = document.createElement('option');
+      option.value = option.textContent = event.type; $('type').append(option);
+    }
+    $('status-text').textContent = data.status.message + ' · WebSocket 实时' + (data.status.protocol_errors ? ` · 协议错误 ${data.status.protocol_errors} 次：${data.status.protocol_error}` : '');
+    const rx = data.status.receive;
+    if (rx) $('receive-status').textContent = `本次连接：${rx.gateway_unit === undefined ? '' : `节点 #${rx.gateway_unit} · `}收到 ${rx.packets} 个蓝牙包 · type 7：${rx.type7_packets} · 验签失败：${rx.invalid_signatures} · 处理异常：${rx.callback_errors} · 旧开关 API 去重：重传 ${rx.legacy_copies} / 跨源配对 ${rx.legacy_paired}。下方原始 type 7 事件在去重前保存。`;
+    $('dot').className = data.status.state === 'connected' ? 'live' : ['failed', 'disconnected'].includes(data.status.state) ? 'error' : '';
+    if (data.status.network) $('network').textContent = data.status.network + ' · ' + data.status.units + ' 台设备 · Mac 本地蓝牙';
+    if (!paused && (data.events.length || data.reset)) render();
+  };
+  socket.onclose = () => {
+    $('dot').className = 'error'; $('status-text').textContent = 'WebSocket 已断开，正在重连并补发保留的事件…';
+    setTimeout(connect, reconnectDelay); reconnectDelay = Math.min(10000, reconnectDelay * 2);
+  };
+  socket.onerror = () => socket.close();
+}
+for (const id of ['query', 'type', 'source']) $(id).addEventListener('input', render);
+$('reset').onclick = () => { $('query').value = $('type').value = $('source').value = ''; render(); };
+$('pause').onclick = () => {
+  paused = !paused; $('pause').textContent = paused ? '恢复显示' : '暂停显示';
+  $('pause').setAttribute('aria-pressed', String(paused));
+  if (!paused) render(); else $('notice').textContent = '显示已暂停，后台仍继续采集；恢复后补上保留的事件。';
+};
+connect();
+</script>
+</html>

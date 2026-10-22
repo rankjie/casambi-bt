@@ -101,6 +101,24 @@ def wired_click(t0: float, handle: int) -> list[tuple[float, bytes]]:
 
 
 class TestCopySuppression(unittest.TestCase):
+    def test_lifetime_longer_than_default_copy_window(self) -> None:
+        """A five-second invocation remains a copy at 3.5 seconds."""
+        payload = frame(0x2803, 30, 0x20B1, 0x2006, 4, b"\x89\x00\x02")
+        decoder = SwitchEventStreamDecoder()
+        first, _ = decoder.decode(payload, now=0.0)
+        copied, stats = decoder.decode(payload, now=3.5)
+        wrapped, _ = decoder.decode(payload, now=5.1)
+        self.assertEqual(semantic(first), ["button_press"])
+        self.assertEqual(copied, [])
+        self.assertEqual(stats.events_suppressed_copies, 1)
+        self.assertEqual(semantic(wrapped), ["button_press"])
+
+    def test_short_button_payload_is_not_a_press(self) -> None:
+        """Match the official minimum before emitting a switch action."""
+        for payload in (b"\x80", b"\x80\x00"):
+            events, _ = SwitchEventStreamDecoder().decode(frame(0x0800 | len(payload), 29, 0x2001, 0x2006, 0, payload))
+            self.assertEqual(events, [])
+
     def test_reflood_copies_share_origin_and_are_dropped(self) -> None:
         r = Replay()
         out = r.feed(

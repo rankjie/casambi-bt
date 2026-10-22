@@ -92,13 +92,14 @@ Python mapping:
   - ButtonEvent3 -> label 3
 
 Duplicate handling (all frame kinds):
-- `origin` is `unit << 8 | handle`; `handle` is the emitting unit's invocation counter and
-  advances with every invocation it sends, so two physical presses never share it.
+- `origin` is `unit << 8 | counter`; the low byte advances for emitted invocations and can
+  wrap. It is distinct from the optional response-correlation `origin_handle` field.
 - `age` is in 10 ms ticks and `lifetime` (flags bits 11-14) in seconds. The mesh re-floods a
   frame until its lifetime expires; every copy has the same origin/opcode/target/payload and a
   larger `age`. Button frames were seen with lifetime 1 s, NotifyInput with 2 s.
 - The decoder drops a frame whose `(origin, opcode, target, payload)` was already processed in
-  the last 3 s. No "currently pressed" state is kept, so a lost frame cannot suppress a later one.
+  last 3 s, extended to the declared lifetime if longer. This only addresses copies of one
+  invocation; cross-source pairing has a separate ambiguity described below.
 
 ### NotifyInput Stream (target_type 0x12)
 
@@ -134,7 +135,11 @@ Wired vs wireless behavior:
 Cross-source pairing:
 - For each `(unit_id, button, press|release)` the first report from either stream is emitted;
   the report from the other stream inside 3 s is consumed (counted, not stateful). If one stream
-  loses a frame, the other one still produces the event.
+  loses a frame, the other one may still produce the event. Complementary losses in successive
+  rapid clicks can consume a real later event; the two sources carry no proven shared action ID.
+  This heuristic and the 500 ms threshold belong to the legacy semantic switch API, not the
+  official type 7 receive contract. The Network Events API preserves each received frame
+  before this heuristic; see [Network Events](../docs/network-events.md).
 
 ## Packet Type 0x06: UnitState Stream
 

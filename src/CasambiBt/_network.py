@@ -519,7 +519,7 @@ class Network:
             if cacheExpiry < datetime.utcnow():
                 self._logger.info("Cache expiry for type %i. Refetching.", id)
                 self._unitTypes.pop(id)
-            else:
+            elif cachedType is None or getattr(cachedType, "eventProfile", None) is not None:
                 self._logger.info("Using cached type.")
                 return cachedType
 
@@ -568,6 +568,7 @@ class Network:
             unitTypeJson["mode"],
             unitTypeJson["stateLength"],
             controls,
+            unitTypeJson,
         )
 
         # Chache unit type

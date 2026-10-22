@@ -12,6 +12,7 @@ from httpx import AsyncClient, RequestError
 from ._cache import Cache
 from ._client import CasambiClient, ConnectionState, IncommingPacketType, ProtocolMode
 from ._network import Network
+from ._network_events import NetworkEventDecoder
 from ._operation import OpCode, OperationsContext
 from ._unit import Group, Scene, Unit, UnitControlType, UnitState
 from .errors import ConnectionStateError, ProtocolError
@@ -34,6 +35,9 @@ class Casambi:
 
         self._unitChangedCallbacks: list[Callable[[Unit], None]] = []
         self._switchEventCallbacks: list[Callable[[dict[str, Any]], None]] = []
+        self._networkEventCallbacks: list[Callable[[dict[str, Any]], None]] = []
+        self._receiveDiagnosticCallbacks: list[Callable[[dict[str, Any]], None]] = []
+        self._networkEventDecoder = NetworkEventDecoder()
         self._disconnectCallbacks: list[Callable[[], None]] = []
 
         self._logger = logging.getLogger(__name__)
@@ -108,17 +112,36 @@ class Casambi:
             return self._casaNetwork.rawNetworkData
         return None
 
+    @property
+    def connectionInfo(self) -> dict[str, Any] | None:
+        """Return observed connection metadata, without authentication material."""
+        if not self.connected:
+            return None
+        client = cast(CasambiClient, self._casaClient)
+        mode = client.protocolMode
+        assert mode is not None, "Authenticated client has no protocol mode"
+        return {
+            "address": client.address,
+            "gateway_unit": getattr(client, "_unit", None),
+            "device_protocol": getattr(client, "_deviceProtocolVersion", None),
+            "protocol_mode": mode.name.lower(),
+        }
+
     async def connect(
         self,
         addr_or_device: str | BLEDevice,
         password: str,
         forceOffline: bool = False,
+        *,
+        networkAddress: str | None = None,
     ) -> None:
         """Connect and authenticate to a network.
 
         :param addr: The MAC address of the network or a BLEDevice. Use `discover` to find the address of a network.
         :param password: The password for the network.
         :param forceOffline: Whether to avoid contacting the casambi servers.
+        :param networkAddress: Original network address used for cloud access and
+            cached keys when addr_or_device selects a different GATT node.
         :raises AuthenticationError: The supplied password is invalid.
         :raises ProtocolError: The network did not follow the expected protocol.
         :raises NetworkNotFoundError: No network was found under the supplied address.
@@ -131,7 +154,9 @@ class Casambi:
         else:
             # Add colons if necessary.
             if ":" not in addr_or_device:
-                addr_or_device = ":".join(["".join(p) for p in pairwise(addr)][::2])
+                addr_or_device = ":".join(
+                    ["".join(p) for p in pairwise(addr_or_device)][::2]
+                )
             addr = addr_or_device
 
         self._logger.info(f"Trying to connect to casambi network {addr}...")
@@ -140,7 +165,9 @@ class Casambi:
             self._httpClient = AsyncClient()
 
         # Retrieve network information
-        uuid = addr.replace(":", "").lower()
+        uuid = (networkAddress if networkAddress is not None else addr).replace(
+            ":", ""
+        ).lower()
         await self._cache.setUuid(uuid)
         self._casaNetwork = Network(uuid, self._httpClient, self._cache)
         await self._casaNetwork.load()
@@ -161,11 +188,14 @@ class Casambi:
             self._dataCallback,
             self._disconnectCallback,
             self._casaNetwork,
+            invocationCallback=self._invocationCallback,
+            receiveDiagnosticCallback=self._receiveDiagnosticCallback,
         )
         await self._connectClient()
 
     async def _connectClient(self) -> None:
         """Initiate the bluetooth connection."""
+        self._networkEventDecoder.reset()
         self._casaClient = cast(CasambiClient, self._casaClient)
         await self._casaClient.connect()
         try:
@@ -181,6 +211,9 @@ class Casambi:
         except ProtocolError as e:
             await self._casaClient.disconnect()
             raise e
+        info = self.connectionInfo
+        if info is not None:
+            self._receiveDiagnosticCallback({"stage": "connection", **info})
 
     async def setUnitState(self, target: Unit, state: UnitState) -> None:
         """Set the state of one unit directly.
@@ -571,6 +604,11 @@ class Casambi:
                     u._on = data["on"]
                     u._online = data["online"]
 
+                    if self._networkEventCallbacks:
+                        self._emitNetworkEvents(
+                            self._networkEventDecoder.decode(u, data["state"])
+                        )
+
                     # Notify listeners
                     for h in self._unitChangedCallbacks:
                         try:
@@ -614,6 +652,65 @@ class Casambi:
         """
         self._unitChangedCallbacks.append(handler)
         self._logger.debug(f"Registered unit changed handler {handler}")
+
+    def _invocationCallback(
+        self, data: bytes, packet_seq: int | None, arrival_sequence: int
+    ) -> None:
+        if self._networkEventCallbacks:
+            self._emitNetworkEvents(
+                self._networkEventDecoder.decode_invocations(
+                    data,
+                    names={unit.deviceId: unit.name for unit in self.units},
+                    packet_sequence=packet_seq,
+                    arrival_sequence=arrival_sequence,
+                )
+            )
+
+    def _emitNetworkEvents(self, events: list[dict[str, Any]]) -> None:
+        for event in events:
+            for handler in tuple(self._networkEventCallbacks):
+                try:
+                    handler(dict(event))
+                except Exception:
+                    # A consumer failure must not stop delivery to other consumers.
+                    self._logger.exception("Exception in network event handler %r", handler)
+
+    def registerNetworkEventHandler(self, handler: Callable[[dict[str, Any]], None]) -> None:
+        """Receive profile state changes and decoded input events for this network.
+
+        Rows contain the official page's time, timestamp, unit, name, type and value
+        fields, plus source and decoding details. Register before connecting to
+        receive the initial snapshot. State copies are suppressed per control;
+        type 7 rows expose received frames before the legacy switch decoder's
+        inferred cross-source merging. Unknown invocation payloads remain opaque.
+        """
+        self._networkEventCallbacks.append(handler)
+
+    def unregisterNetworkEventHandler(self, handler: Callable[[dict[str, Any]], None]) -> None:
+        """Remove a network event handler; raise ValueError if it was not registered."""
+        self._networkEventCallbacks.remove(handler)
+
+    def _receiveDiagnosticCallback(self, diagnostic: dict[str, Any]) -> None:
+        for handler in tuple(self._receiveDiagnosticCallbacks):
+            try:
+                handler(dict(diagnostic))
+            except Exception as error:
+                # Diagnostics are an independent consumer, never the BLE control path.
+                self._logger.error(
+                    "Receive diagnostic consumer failed (%s)", type(error).__name__
+                )
+
+    def registerReceiveDiagnosticHandler(
+        self, handler: Callable[[dict[str, Any]], None]
+    ) -> None:
+        """Receive packet/decoder metadata and authenticated connection information."""
+        self._receiveDiagnosticCallbacks.append(handler)
+
+    def unregisterReceiveDiagnosticHandler(
+        self, handler: Callable[[dict[str, Any]], None]
+    ) -> None:
+        """Remove a receive metadata consumer; raise ValueError if unregistered."""
+        self._receiveDiagnosticCallbacks.remove(handler)
 
     def unregisterUnitChangedHandler(self, handler: Callable[[Unit], None]) -> None:
         """Unregister an existing unit state change handler.

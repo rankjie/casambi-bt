@@ -28,7 +28,7 @@ Have a look at `demo.py` for a small example.
 
 This library supports receiving physical switch events as a decoded stream of INVOCATION frames (ground truth from the official Android app).
 
-Event types you can expect, exactly one per physical action:
+Semantic event types supported by the capture-derived switch decoder:
 - `button_press`
 - `button_release` (short press; `press_duration_ms` is set when reported by the switch itself)
 - `button_hold` (long press threshold reached)
@@ -74,7 +74,20 @@ casa.registerSwitchEventHandler(handle_switch_event)
 Notes:
 - Wireless (battery) switches send a "button stream" (target_type `0x06`) for press/release with the press duration; a mains unit additionally reports the same action as NotifyInput (target_type `0x12`), which is also the only carrier of hold.
 - Wired switches often only send NotifyInput (target_type `0x12`); its `input_code` is mapped into `button_press/button_release/...`.
-- The mesh re-floods every frame several times. The library drops these copies by invocation identity (origin handle + opcode + target + payload) and pairs the two streams by count, so no per-button state is kept and a lost or reordered frame never swallows a later press. Consumers do not need their own deduplication.
+- Mesh copies are suppressed by invocation identity for at least 3 seconds, extended to the declared lifetime when longer. The legacy switch API also pairs ButtonEvent and NotifyInput reports by count within 3 seconds. That heuristic can consume a real event when rapid clicks have complementary losses across the two sources. Its 500 ms long-press threshold and four-gang button labels are capture-derived assumptions.
+
+### Selecting a GATT node
+
+Pass a node's `BLEDevice` to `connect` and set `networkAddress` to the original
+network MAC address. Cloud access and cached keys continue to use that network
+identity while the Bluetooth connection uses the selected node. Omitting
+`networkAddress` preserves the existing connection behavior.
+
+### Network Events
+
+`registerNetworkEventHandler` exposes profile-driven state changes and type 7 protocol observations for the whole connected network. The type 7 path preserves ButtonEvent and NotifyInput separately, including their raw indices, flags, origin/target, optional origin handle, packet sequence and input fields. It does not apply the legacy switch API's cross-source pairing or inferred long-press threshold.
+
+The local Mac viewer uses WebSocket updates, preserves expanded details, supports optional LAN listeners and saves event history across restarts. See [Network Events](docs/network-events.md) for the API, protocol evidence and demo commands.
 
 For the parsing details and field layout, see `doc/PROTOCOL_PARSING.md`.
 

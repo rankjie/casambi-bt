@@ -149,3 +149,5 @@ cython_debug/
 
 # Local dev scripts can include credentials; keep them out of git.
 local_listen.py
+network-events.jsonl
+network-events.receive.jsonl

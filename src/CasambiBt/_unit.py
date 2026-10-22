@@ -84,6 +84,7 @@ class UnitType:
     mode: str
     stateLength: int
     controls: list[UnitControl]
+    eventProfile: dict[str, Any] | None = None
 
     def get_control(self, controlType: UnitControlType) -> UnitControl | None:
         """Return the control description if the unit type supports the given type of control.

@@ -80,8 +80,9 @@ class SwitchEventStreamDecoder:
        counter, so two distinct presses never share a key while re-flood copies always do.
     2. Cross-source pairing by count: for each ``(unit, button, press|release)`` the first
        report from either source is emitted and the report from the other source is consumed.
-       No per-button "currently pressed" state is kept, so a lost or reordered frame can
-       never swallow a later real event.
+       This is a capture-derived heuristic: complementary losses across rapid clicks
+       can cause a later report to be consumed. Use the network invocation stream
+       when preserving each received source frame matters.
     """
 
     def __init__(
@@ -92,7 +93,7 @@ class SwitchEventStreamDecoder:
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
         self._clock = clock
-        # (origin, opcode, target, payload) -> first seen (monotonic seconds)
+        # (origin, opcode, target, payload) -> copy-suppression expiry
         self._seen: dict[tuple[int, int, int, bytes], float] = {}
         # (unit_id, button_event_index, kind, source) -> times of emitted events still waiting
         # for their mirror from the other source.
@@ -145,8 +146,8 @@ class SwitchEventStreamDecoder:
     # ------------------------------------------------------------------ bookkeeping
 
     def _expire(self, now: float) -> None:
-        for key, first_seen in list(self._seen.items()):
-            if now - first_seen > COPY_WINDOW_S:
+        for key, expires in list(self._seen.items()):
+            if now > expires:
                 del self._seen[key]
         for pkey, times in list(self._pending.items()):
             while times and now - times[0] > PAIR_WINDOW_S:
@@ -158,7 +159,7 @@ class SwitchEventStreamDecoder:
         key = (frame.origin, frame.opcode, frame.target, bytes(frame.payload))
         if key in self._seen:
             return True
-        self._seen[key] = now
+        self._seen[key] = now + max(COPY_WINDOW_S, (frame.flags >> 11) & 15)
         return False
 
     def _claim(self, unit_id: int, index: int, kind: str, source: str, now: float) -> bool:
@@ -196,7 +197,7 @@ class SwitchEventStreamDecoder:
         if (
             target_type == _TARGET_TYPE_BUTTON
             and _BUTTON_EVENT_MIN <= frame.opcode <= _BUTTON_EVENT_MAX
-            and frame.payload
+            and len(frame.payload) >= 3
         ):
             stats.frames_button += 1
             return self._decode_button_frame(
@@ -461,6 +462,7 @@ class SwitchEventStreamDecoder:
             "origin": frame.origin,
             "origin_unit_id": (frame.origin >> 8) & 0xFF,
             "origin_type": frame.origin & 0xFF,
+            "origin_counter": frame.origin & 0xFF,
             "target": frame.target,
             "target_type": frame.target & 0xFF,
             "age": frame.age,
