@@ -678,7 +678,13 @@ class CasambiClient:
         previous_state = self._connectionState
         if previous_state != ConnectionState.NONE:
             self._logger.info(f"Received disconnect callback from {self.address}")
+        if self._classicNoRxTask is not None:
+            self._classicNoRxTask.cancel()
+            self._classicNoRxTask = None
         if previous_state == ConnectionState.AUTHENTICATED:
+            # Consumers may start reconnecting from the callback (HA runs it as an
+            # eager task), so they must already see the link as down.
+            self._connectionState = ConnectionState.NONE
             self._logger.debug("Executing disconnect callback.")
             self._disconnectedCallback()
         elif previous_state != ConnectionState.NONE:
@@ -686,11 +692,6 @@ class CasambiClient:
             # raises instead of leaving the reconnect task stuck forever.
             self._connectionState = ConnectionState.ERROR
             self._notifySignal.set()
-        if self._classicNoRxTask is not None:
-            self._classicNoRxTask.cancel()
-            self._classicNoRxTask = None
-        if previous_state == ConnectionState.AUTHENTICATED:
-            self._connectionState = ConnectionState.NONE
 
     async def exchangeKey(self) -> None:
         self._checkState(ConnectionState.CONNECTED)
