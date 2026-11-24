@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from binascii import b2a_hex as b2a
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
@@ -9,13 +9,14 @@ from typing import Any, cast
 from bleak.backends.device import BLEDevice
 from httpx import AsyncClient, RequestError
 
+from ._backup import createBackup, restoreBackup
 from ._cache import Cache
 from ._client import CasambiClient, ConnectionState, IncommingPacketType, ProtocolMode
 from ._network import Network
 from ._network_events import NetworkEventDecoder
 from ._operation import OpCode, OperationsContext
 from ._unit import Group, Scene, Unit, UnitControlType, UnitState
-from .errors import ConnectionStateError, ProtocolError
+from .errors import CloudUnavailableError, ConnectionStateError, ProtocolError
 
 
 class Casambi:
@@ -134,6 +135,7 @@ class Casambi:
         forceOffline: bool = False,
         *,
         networkAddress: str | None = None,
+        preferCache: bool = False,
     ) -> None:
         """Connect and authenticate to a network.
 
@@ -142,6 +144,9 @@ class Casambi:
         :param forceOffline: Whether to avoid contacting the casambi servers.
         :param networkAddress: Original network address used for cloud access and
             cached keys when addr_or_device selects a different GATT node.
+        :param preferCache: Use the cached network configuration without
+            contacting the casambi servers if one exists. Use `refreshNetwork`
+            to check for a newer configuration afterwards.
         :raises AuthenticationError: The supplied password is invalid.
         :raises ProtocolError: The network did not follow the expected protocol.
         :raises NetworkNotFoundError: No network was found under the supplied address.
@@ -171,13 +176,14 @@ class Casambi:
         await self._cache.setUuid(uuid)
         self._casaNetwork = Network(uuid, self._httpClient, self._cache)
         await self._casaNetwork.load()
+        if preferCache and not forceOffline and await self._casaNetwork.hasCache():
+            self._logger.info("Using the cached network configuration.")
+            forceOffline = True
         try:
             await self._casaNetwork.logIn(password, forceOffline)
-        # TODO: I don't like that this logic is in this class but I couldn't think of a better way.
-        except RequestError:
+        except (CloudUnavailableError, RequestError) as err:
             self._logger.warning(
-                "Network error while logging in. Trying to continue offline.",
-                exc_info=True,
+                "Casambi cloud can't be used (%s). Trying to continue offline.", err
             )
             forceOffline = True
 
@@ -192,6 +198,53 @@ class Casambi:
             receiveDiagnosticCallback=self._receiveDiagnosticCallback,
         )
         await self._connectClient()
+
+    async def refreshNetwork(self, password: str) -> bool:
+        """Check the cloud for a newer network configuration.
+
+        A newer configuration is stored in the cache and used by the next
+        connect; the units, groups and scenes in use are not changed.
+
+        :param password: The password for the network.
+        :return: True if a newer configuration was downloaded.
+        :raises AuthenticationError: The cloud rejected the password or session.
+        :raises CloudUnavailableError: The cloud can't be used at the moment.
+        :raises ConnectionStateError: There is no network loaded.
+        """
+        self._checkNetwork()
+        network = cast(Network, self._casaNetwork)
+        await network.logIn(password)
+        return await network.fetchUpdate()
+
+    @property
+    def networkRevision(self) -> int:
+        """Revision of the network configuration in use."""
+        self._checkNetwork()
+        return cast(int, self._casaNetwork.revision)  # type: ignore[union-attr]
+
+    async def exportOfflineBackup(self) -> dict[str, Any]:
+        """Export everything needed to use the network without the cloud.
+
+        The backup is JSON serializable and contains the network configuration
+        including the keys of the network. Treat it like a password.
+
+        :raises ConnectionStateError: There is no network loaded.
+        :raises OfflineBackupError: The configuration or a unit type isn't cached.
+        """
+        self._checkNetwork()
+        return await createBackup(cast(Network, self._casaNetwork))
+
+    async def importOfflineBackup(self, backup: Mapping[str, Any]) -> str:
+        """Restore an offline backup into the cache.
+
+        A following connect with `preferCache` or `forceOffline` uses the
+        restored configuration and doesn't need the cloud.
+
+        :param backup: A backup created by `exportOfflineBackup`.
+        :return: The bluetooth address of the network in the backup.
+        :raises OfflineBackupError: The backup is invalid.
+        """
+        return await restoreBackup(self._cache, backup)
 
     async def _connectClient(self) -> None:
         """Initiate the bluetooth connection."""

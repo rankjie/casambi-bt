@@ -15,13 +15,22 @@ from ._keystore import KeyStore
 from ._unit import Group, Scene, Unit, UnitControl, UnitControlType, UnitType
 from .errors import (
     AuthenticationError,
+    CloudUnavailableError,
     NetworkNotFoundError,
     NetworkOnlineUpdateNeededError,
-    NetworkUpdateError,
 )
 
 SESSION_CACHE_FILE: Final = "session.pck"
 TYPES_CACHE_FILE: Final = "types.pck"
+NETWORK_ID_FILE: Final = "networkid"
+
+# Unit types are refetched after this time when the cloud is used. An expired
+# type stays in use while the cloud can't be reached.
+TYPE_CACHE_DURATION: Final = timedelta(days=28)
+
+# Login answers that reject the credentials. Every other error of the cloud
+# (maintenance, rate limits, ...) says nothing about the password.
+AUTH_REJECTED_STATUSES: Final = frozenset({httpx.codes.UNAUTHORIZED})
 
 
 @dataclass()
@@ -145,49 +154,80 @@ class Network:
             typeData = pickle.dumps(self._unitTypes)
             await (cachePath / TYPES_CACHE_FILE).write_bytes(typeData)
 
+    async def _readCachedNetworkId(self) -> None:
+        async with self._cache as cachePath:
+            networkCacheFile = cachePath / NETWORK_ID_FILE
+            if await networkCacheFile.exists():
+                self._id = (await networkCacheFile.read_text()).strip() or None
+
+    async def _readCachedNetwork(self) -> dict[str, Any] | None:
+        """Return the cached network configuration or None if there is none."""
+        if not self._id:
+            return None
+        async with self._cache as cachePath:
+            cachedNetworkPath = cachePath / f"{self._id}.json"
+            if not await cachedNetworkPath.exists():
+                return None
+            try:
+                network = json.loads(await cachedNetworkPath.read_bytes())
+                int(network["network"]["revision"])
+            except (ValueError, KeyError, TypeError):
+                self._logger.warning("Cached network is unreadable.", exc_info=True)
+                return None
+            return cast(dict[str, Any], network)
+
+    async def hasCache(self) -> bool:
+        """Return True if the network configuration can be loaded without the cloud."""
+        await self._readCachedNetworkId()
+        return await self._readCachedNetwork() is not None
+
     async def getNetworkId(self, forceOffline: bool = False) -> None:
         self._logger.info("Getting network id...")
 
-        async with self._cache as cachePath:
-            networkCacheFile = cachePath / "networkid"
-
-            if await networkCacheFile.exists():
-                self._id = await networkCacheFile.read_text()
+        await self._readCachedNetworkId()
 
         if forceOffline:
             if not self._id:
                 raise NetworkOnlineUpdateNeededError("Network isn't cached.")
-            else:
-                return
+            return
 
         getNetworkIdUrl = f"https://api.casambi.com/network/uuid/{self._uuid}"
         try:
             res = await self._httpClient.get(getNetworkIdUrl)
-        except RequestError as err:
+            new_id = (
+                str(res.json()["id"]) if res.status_code == httpx.codes.OK else None
+            )
+        except (RequestError, ValueError, KeyError, TypeError) as err:
             if not self._id:
-                raise NetworkOnlineUpdateNeededError from err
-            else:
+                raise NetworkOnlineUpdateNeededError(
+                    "Casambi cloud not usable and network id isn't cached."
+                ) from err
+            self._logger.warning(
+                "Failed to fetch network id. Continuing with cache.", exc_info=True
+            )
+            return
+
+        if new_id is None:
+            if self._id:
+                # The id of a network never changes, the cached one is fine.
                 self._logger.warning(
-                    "Network error while fetching network id. Continuing with cache.",
-                    exc_info=True,
+                    "Getting network id returned status %i. Continuing with cache.",
+                    res.status_code,
                 )
                 return
-
-        if res.status_code == httpx.codes.NOT_FOUND:
-            raise NetworkNotFoundError(
-                "API failed to find network. Is your network configured correctly?"
+            if res.status_code == httpx.codes.NOT_FOUND:
+                raise NetworkNotFoundError(
+                    "API failed to find network. Is your network configured correctly?"
+                )
+            raise CloudUnavailableError(
+                f"Getting network id returned unexpected status {res.status_code}",
+                res.status_code,
             )
-        if res.status_code != httpx.codes.OK:
-            raise NetworkNotFoundError(
-                f"Getting network id returned unexpected status {res.status_code}"
-            )
 
-        new_id = cast(str, res.json()["id"])
         if self._id != new_id:
             self._logger.info(f"Network id changed from {self._id} to {new_id}.")
             async with self._cache as cachePath:
-                networkCacheFile = cachePath / "networkid"
-                await networkCacheFile.write_text(new_id)
+                await (cachePath / NETWORK_ID_FILE).write_text(new_id)
             self._id = new_id
         self._logger.info(f"Got network id {self._id}.")
 
@@ -207,6 +247,11 @@ class Network:
     @property
     def protocolVersion(self) -> int:
         return self._protocolVersion
+
+    @property
+    def revision(self) -> int | None:
+        """Revision of the network configuration in use."""
+        return self._networkRevision
 
     @property
     def grade(self) -> int | None:
@@ -231,6 +276,11 @@ class Network:
         return self._rawNetworkData
 
     async def logIn(self, password: str, forceOffline: bool = False) -> None:
+        """Log in to the cloud unless a valid session exists.
+
+        :raises AuthenticationError: The cloud rejected the password.
+        :raises CloudUnavailableError: The cloud can't be used at the moment.
+        """
         await self.getNetworkId(forceOffline)
 
         # No need to be authenticated if we try to be offline anyway.
@@ -240,125 +290,162 @@ class Network:
         self._logger.info("Logging in to network...")
         getSessionUrl = f"https://api.casambi.com/network/{self._id}/session"
 
-        res = await self._httpClient.post(
-            getSessionUrl,
-            json={
-                "token": self._token,
-                "password": password,
-                "deviceName": DEVICE_NAME,
-            },
-        )
-        if res.status_code == httpx.codes.OK:
-            # Parse session
+        try:
+            res = await self._httpClient.post(
+                getSessionUrl,
+                json={
+                    "token": self._token,
+                    "password": password,
+                    "deviceName": DEVICE_NAME,
+                },
+            )
+        except RequestError as err:
+            raise CloudUnavailableError("Casambi cloud not reachable.") from err
+
+        if res.status_code in AUTH_REJECTED_STATUSES:
+            raise AuthenticationError(
+                f"Login failed: {res.status_code}", status_code=res.status_code
+            )
+        if res.status_code != httpx.codes.OK:
+            raise CloudUnavailableError(
+                f"Login failed: {res.status_code}", res.status_code
+            )
+
+        try:
             sessionJson = res.json()
             sessionJson["expires"] = datetime.utcfromtimestamp(
                 sessionJson["expires"] / 1000
             )
             self._session = _NetworkSession(**sessionJson)
-            self._logger.info("Login sucessful.")
-            await self._saveSesion()
-        else:
-            raise AuthenticationError(f"Login failed: {res.status_code}\n{res.text}")
+        except (ValueError, KeyError, TypeError) as err:
+            raise CloudUnavailableError("Malformed login response.") from err
+        self._logger.info("Login sucessful.")
+        await self._saveSesion()
+
+    async def _dropSession(self) -> None:
+        self._session = None
+        async with self._cache as cachePath:
+            await (cachePath / SESSION_CACHE_FILE).unlink(missing_ok=True)
+
+    async def _fetchNetwork(self, revision: int) -> dict[str, Any] | None:
+        """Fetch the network configuration if the cloud has a newer revision.
+
+        A newer configuration is written to the cache.
+
+        :return: The new configuration or None if the given revision is current.
+        :raises AuthenticationError: Not logged in or the session was revoked.
+        :raises CloudUnavailableError: The cloud can't be used at the moment.
+        """
+        if not self.authenticated():
+            raise AuthenticationError("Not authenticated!")
+        assert self._session is not None
+
+        getNetworkUrl = f"https://api.casambi.com/network/{self._id}/"
+        payload: dict[str, Any] = {
+            "formatVersion": 1,
+            "deviceName": DEVICE_NAME,
+            "revision": revision,
+        }
+        try:
+            # **SECURITY**: Do not set session header for client! This could leak the session with external clients.
+            res = await self._httpClient.put(
+                getNetworkUrl,
+                json=payload,
+                headers={"X-Casambi-Session": self._session.session},
+            )
+            if res.status_code == httpx.codes.BAD_REQUEST:
+                # Some backend variants may reject the minimal update payload.
+                # Retry once with Android-like fields (token/clientInfo).
+                self._logger.warning(
+                    "[CASAMBI_CLOUD_UPDATE_RETRY] status=400 retry_with_token_clientInfo=true"
+                )
+                payload["token"] = self._token
+                payload["clientInfo"] = self._clientInfo
+                res = await self._httpClient.put(
+                    getNetworkUrl,
+                    json=payload,
+                    headers={"X-Casambi-Session": self._session.session},
+                )
+        except RequestError as err:
+            raise CloudUnavailableError("Casambi cloud not reachable.") from err
+
+        if res.status_code == httpx.codes.GONE:
+            # Happens when the password changes. Only the session is invalid:
+            # keep the configuration and its keys so the network keeps working
+            # offline until the user logs in again.
+            self._logger.error("API reports that the session is gone.")
+            await self._dropSession()
+            raise AuthenticationError(
+                "Session is no longer valid.", status_code=res.status_code
+            )
+        if res.status_code != httpx.codes.OK:
+            raise CloudUnavailableError(
+                f"Network update failed: {res.status_code}", res.status_code
+            )
+
+        try:
+            updateResult = cast(dict[str, Any], res.json())
+            if updateResult["status"] == "UPTODATE":
+                return None
+            int(updateResult["network"]["revision"])
+        except (ValueError, KeyError, TypeError) as err:
+            raise CloudUnavailableError("Malformed network response.") from err
+
+        async with self._cache as cachePath:
+            await (cachePath / f"{self._id}.json").write_bytes(res.content)
+        return updateResult
 
     async def update(self, forceOffline: bool = False) -> None:
+        """Load the network configuration, from the cloud if possible.
+
+        Cloud errors fall back to the cached configuration.
+
+        :raises AuthenticationError: Not logged in or the session was revoked.
+        :raises NetworkOnlineUpdateNeededError: The network isn't cached and
+            the cloud can't be used.
+        """
         self._logger.info("Updating network...")
         if not self.authenticated() and not forceOffline:
             raise AuthenticationError("Not authenticated!")
 
-        assert self._id is not None, "Network id must be set."
+        if self._id is None:
+            # Only reachable offline: the cloud didn't provide the id either.
+            raise NetworkOnlineUpdateNeededError("Network isn't cached.")
 
-        # TODO: Save and send revision to receive actual updates?
-
-        async with self._cache as cachePath:
-            cachedNetworkPah = cachePath / f"{self._id}.json"
-            if await cachedNetworkPah.exists():
-                network = json.loads(await cachedNetworkPah.read_bytes())
-                self._rawNetworkData = network
-                self._networkRevision = network["network"]["revision"]
-                self._logger.info(
-                    f"Loaded cached network. Revision: {self._networkRevision}"
-                )
-            else:
-                if forceOffline:
-                    raise NetworkOnlineUpdateNeededError("Network isn't cached.")
-                self._networkRevision = 0
+        network = await self._readCachedNetwork()
+        if network is not None:
+            self._networkRevision = int(network["network"]["revision"])
+            self._logger.info(
+                f"Loaded cached network. Revision: {self._networkRevision}"
+            )
+        elif forceOffline:
+            raise NetworkOnlineUpdateNeededError("Network isn't cached.")
+        else:
+            self._networkRevision = 0
 
         if not forceOffline:
-            getNetworkUrl = f"https://api.casambi.com/network/{self._id}/"
-
             try:
-                payload = {
-                    "formatVersion": 1,
-                    "deviceName": DEVICE_NAME,
-                    "revision": self._networkRevision,
-                }
-
-                # **SECURITY**: Do not set session header for client! This could leak the session with external clients.
-                res = await self._httpClient.put(
-                    getNetworkUrl,
-                    json=payload,
-                    headers={"X-Casambi-Session": self._session.session},  # type: ignore[union-attr]
-                )
-
-                # Apparently this happens when the password changes.
-                # In this case we should at least invalidate the session.
-                # Currently we invalidate the whole cache for the network since recreating it doesn't cost much.
-                if res.status_code == httpx.codes.GONE:
-                    self._logger.error(
-                        "API reports that network is gone. Deleting cache. Retry later."
-                    )
-                    await self._cache.invalidateCache()
-
-                if res.status_code == httpx.codes.BAD_REQUEST:
-                    # Some backend variants may reject the minimal update payload.
-                    # Retry once with Android-like fields (token/clientInfo) for diagnostics/testing.
-                    self._logger.warning(
-                        "[CASAMBI_CLOUD_UPDATE_RETRY] status=400 retry_with_token_clientInfo=true body_prefix=%r",
-                        (res.text or "")[:200],
-                    )
-                    payload2: dict[str, Any] = dict(payload)
-                    payload2["token"] = self._token
-                    payload2["clientInfo"] = self._clientInfo
-                    res = await self._httpClient.put(
-                        getNetworkUrl,
-                        json=payload2,
-                        headers={"X-Casambi-Session": self._session.session},  # type: ignore[union-attr]
-                    )
-
-                if res.status_code != httpx.codes.OK:
-                    body_prefix = (res.text or "")[:500]
-                    # If we have cached network data, do not fail setup; continue offline.
-                    # This is important for HA stability and for "cloud down / API changed" scenarios.
-                    have_cache = bool(self._networkRevision and self._networkRevision > 0 and self._rawNetworkData)
-                    self._logger.warning(
-                        "[CASAMBI_CLOUD_UPDATE_FAILED] status=%s cached_revision=%s continuing_offline=%s body_prefix=%r",
-                        res.status_code,
-                        self._networkRevision,
-                        have_cache,
-                        body_prefix,
-                    )
-                    if not have_cache:
-                        raise NetworkUpdateError("Could not update network!")
-                else:
-                    self._logger.debug(f"Network: {res.text}")
-
-                    updateResult = res.json()
-                    if updateResult["status"] != "UPTODATE":
-                        self._networkRevision = updateResult["network"]["revision"]
-                        self._rawNetworkData = updateResult
-                        async with self._cache as cachePath:
-                            cachedNetworkPah = cachePath / f"{self._id}.json"
-                            await cachedNetworkPah.write_bytes(res.content)
-                        network = updateResult
-                        self._logger.info(
-                            f"Fetched updated network with revision {self._networkRevision}"
-                        )
-            except RequestError as err:
-                if self._networkRevision == 0:
-                    raise NetworkUpdateError from err
+                fresh = await self._fetchNetwork(self._networkRevision or 0)
+            except CloudUnavailableError as err:
+                if network is None:
+                    raise NetworkOnlineUpdateNeededError(
+                        "Network isn't cached and the cloud can't be used."
+                    ) from err
                 self._logger.warning(
-                    "Failed to update network. Continuing offline.", exc_info=True
+                    "[CASAMBI_CLOUD_UPDATE_FAILED] %s cached_revision=%s continuing_offline=true",
+                    err,
+                    self._networkRevision,
                 )
+            else:
+                if fresh is not None:
+                    network = fresh
+                    self._networkRevision = int(fresh["network"]["revision"])
+                    self._logger.info(
+                        f"Fetched updated network with revision {self._networkRevision}"
+                    )
+
+        assert network is not None
+        self._rawNetworkData = network
 
         # Prase general information
         self._networkName = network["network"]["name"]
@@ -414,7 +501,7 @@ class Network:
         units = network["network"]["units"]
         units_with_security_key = 0
         for u in units:
-            uType = await self._fetchUnitInfo(u["type"])
+            uType = await self._fetchUnitInfo(u["type"], forceOffline)
             if uType is None:
                 self._logger.info(
                     "Failed to fetch type for unit %i. Skipping.", u["type"]
@@ -508,47 +595,102 @@ class Network:
 
         self._logger.info("Network updated.")
 
-    async def _fetchUnitInfo(self, id: int) -> UnitType | None:
-        self._logger.info(f"Fetching unit type for id {id}...")
+    async def fetchUpdate(self) -> bool:
+        """Download a newer network configuration into the cache.
 
-        # Check whether unit type is already cached
+        The configuration in use (units, groups, scenes) is left untouched so
+        live objects stay valid; the next connect applies it. The unit types of
+        the new configuration are fetched too so it also works offline.
+
+        :return: True if the cloud had a newer configuration.
+        :raises AuthenticationError: Not logged in or the session was revoked.
+        :raises CloudUnavailableError: The cloud can't be used at the moment.
+        """
+        fresh = await self._fetchNetwork(self._networkRevision or 0)
+        if fresh is None:
+            return False
+        for u in fresh["network"].get("units", []):
+            if isinstance(u, dict) and isinstance(u.get("type"), int):
+                await self._fetchUnitInfo(u["type"])
+        await self._saveTypeCache()
+        return True
+
+    async def _fetchUnitInfo(
+        self, id: int, forceOffline: bool = False
+    ) -> UnitType | None:
+        """Return the type of a unit.
+
+        A cached type is used until it expires. An expired type, or one cached
+        before the fixture JSON was kept, is refetched but stays in use if the
+        cloud can't be used. Failures are not cached so the next connect tries
+        again.
+        """
+        cachedType: UnitType | None = None
         if id in self._unitTypes:
             cachedType, cacheExpiry = self._unitTypes[id]
-
-            # We don't want to cache types forever so use an expiry date.
-            if cacheExpiry < datetime.utcnow():
-                self._logger.info("Cache expiry for type %i. Refetching.", id)
-                self._unitTypes.pop(id)
-            elif cachedType is None or getattr(cachedType, "eventProfile", None) is not None:
-                self._logger.info("Using cached type.")
+            if (
+                cachedType is not None
+                and cachedType.eventProfile is not None
+                and cacheExpiry >= datetime.utcnow()
+            ):
                 return cachedType
 
+        if forceOffline:
+            return cachedType
+
+        self._logger.info(f"Fetching unit type for id {id}...")
         getUnitInfoUrl = f"https://api.casambi.com/fixture/{id}"
-        res = await self._httpClient.get(getUnitInfoUrl)
-
-        if res.status_code != httpx.codes.OK:
-            self._logger.error(f"Getting unit info returned {res.status_code}")
-            self._unitTypes[id] = (
-                None,
-                datetime.utcnow() + timedelta(days=7),
-            )
-            return None
-
-        unitTypeJson = res.json()
-
-        # Parse UnitControls
-        controls = []
-        for controlJson in unitTypeJson["controls"]:
-            typeStr = controlJson["type"].upper()
-            try:
-                type = UnitControlType[typeStr]
-            except KeyError:
+        try:
+            res = await self._httpClient.get(getUnitInfoUrl)
+            if res.status_code != httpx.codes.OK:
                 self._logger.warning(
-                    f"Unsupported control mode {typeStr} in fixture {id}."
+                    "Getting unit info for %i returned %i.", id, res.status_code
                 )
-                type = UnitControlType.UNKOWN
+                return cachedType
+            unitTypeObj = parseUnitType(res.json())
+        except (RequestError, ValueError, KeyError, TypeError):
+            self._logger.warning("Failed to fetch unit info for %i.", id, exc_info=True)
+            return cachedType
 
-            controlObj = UnitControl(
+        self._unitTypes[unitTypeObj.id] = (
+            unitTypeObj,
+            datetime.utcnow() + TYPE_CACHE_DURATION,
+        )
+        self._logger.info("Sucessfully fetched unit type.")
+        return unitTypeObj
+
+    def unitTypes(self) -> dict[int, UnitType]:
+        """Return the known unit types."""
+        return {k: v for k, (v, _) in self._unitTypes.items() if v is not None}
+
+    async def storeUnitTypes(self, types: list[UnitType]) -> None:
+        """Store unit types in the cache, e.g. from an offline backup."""
+        for t in types:
+            self._unitTypes[t.id] = (t, datetime.utcnow() + TYPE_CACHE_DURATION)
+        await self._saveTypeCache()
+
+    async def disconnect(self) -> None:
+        return None
+
+
+def parseUnitType(unitTypeJson: dict[str, Any]) -> UnitType:
+    """Parse a fixture as returned by the cloud. The JSON is kept as event profile."""
+    logger = logging.getLogger(__name__)
+    controls = []
+    for controlJson in unitTypeJson["controls"]:
+        typeStr = str(controlJson["type"]).upper()
+        try:
+            type = UnitControlType[typeStr]
+        except KeyError:
+            logger.warning(
+                "Unsupported control mode %s in fixture %s.",
+                typeStr,
+                unitTypeJson.get("id"),
+            )
+            type = UnitControlType.UNKOWN
+
+        controls.append(
+            UnitControl(
                 type,
                 controlJson["offset"],
                 controlJson["length"],
@@ -557,28 +699,14 @@ class Network:
                 controlJson.get("min", None),
                 controlJson.get("max", None),
             )
-
-            controls.append(controlObj)
-
-        # Parse UnitType
-        unitTypeObj = UnitType(
-            unitTypeJson["id"],
-            unitTypeJson["model"],
-            unitTypeJson["vendor"],
-            unitTypeJson["mode"],
-            unitTypeJson["stateLength"],
-            controls,
-            unitTypeJson,
         )
 
-        # Chache unit type
-        self._unitTypes[unitTypeObj.id] = (
-            unitTypeObj,
-            datetime.utcnow() + timedelta(days=28),
-        )
-
-        self._logger.info("Sucessfully fetched unit type.")
-        return unitTypeObj
-
-    async def disconnect(self) -> None:
-        return None
+    return UnitType(
+        unitTypeJson["id"],
+        unitTypeJson["model"],
+        unitTypeJson["vendor"],
+        unitTypeJson["mode"],
+        unitTypeJson["stateLength"],
+        controls,
+        unitTypeJson,
+    )

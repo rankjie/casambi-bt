@@ -91,6 +91,23 @@ The local Mac viewer uses WebSocket updates, preserves expanded details, support
 
 For the parsing details and field layout, see `doc/PROTOCOL_PARSING.md`.
 
+### Offline start and backups
+
+The bluetooth connection never needs the cloud; only the network configuration
+comes from it.
+
+- `connect(..., preferCache=True)` starts from the cached configuration without
+  contacting the cloud. `refreshNetwork(password)` then downloads a newer
+  configuration into the cache (applied by the next connect) and returns whether
+  there was one.
+- Cloud outages, rate limits and 5xx answers fall back to the cache.
+  `AuthenticationError.status_code` is 401 for a rejected password and 410 for a
+  revoked session; an unusable cloud raises `CloudUnavailableError`.
+- `exportOfflineBackup()` returns a JSON-serializable backup (configuration
+  including the network keys, unit type fixtures). `importOfflineBackup(backup)`
+  writes it into the cache of another installation, after which
+  `connect(..., forceOffline=True)` works without the cloud.
+
 ### Classic (Legacy Firmware) Support (Experimental)
 
 This library can also connect to **Classic** Casambi networks and send **unit control** commands.
